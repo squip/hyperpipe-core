@@ -1,0 +1,96 @@
+{
+  "name": "@hyperpipe/core",
+  "version": "0.1.0",
+  "description": "First-party runtime engine for Hyperpipe clients",
+  "type": "module",
+  "main": "index.mjs",
+  "license": "Apache-2.0",
+  "homepage": "https://hyperpipe.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/squip/hyperpipe.git",
+    "directory": "hyperpipe-core"
+  },
+  "bugs": {
+    "url": "https://github.com/squip/hyperpipe/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "bin": {
+    "hyperpipe-core": "./bin/hyperpipe-core.mjs"
+  },
+  "exports": {
+    ".": "./index.mjs",
+    "./config": "./config.mjs",
+    "./protocol": "./protocol.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "*.js",
+    "*.mjs",
+    "bin/**",
+    "gateway/**",
+    "media/**",
+    "plugins/**",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "scripts": {
+    "dev": "pear run -d .",
+    "test": "brittle test/*.test.js",
+    "test:ipc": "brittle test/group-file-ipc.test.js test/public-gateway-hyperbee-adapter.test.js",
+    "gateway:auth-fixture": "node ./bin/generate-gateway-auth-fixture.mjs",
+    "gateway:auth-validate": "node ./bin/validate-gateway-auth-fixture.mjs",
+    "pack:check": "npm pack --dry-run"
+  },
+  "pear": {
+    "name": "core-app",
+    "type": "terminal",
+    "links": [
+      "http://localhost:1945",
+      "https://*"
+    ]
+  },
+  "dependencies": {
+    "@hyperpipe/bridge": "file:../hyperpipe-bridge",
+    "@noble/curves": "^1.2.0",
+    "@noble/hashes": "^1.3.2",
+    "applesauce-common": "^5.0.0",
+    "applesauce-core": "^5.0.3",
+    "autobase": "6.5.13",
+    "axios": "^1.6.2",
+    "b4a": "^1.6.4",
+    "blind-peering": "^1.14.0",
+    "compact-encoding": "^2.16.1",
+    "corestore": "6.18.4",
+    "express": "^4.18.2",
+    "http": "^0.0.1-security",
+    "https": "^1.0.0",
+    "hyperbee": "2.26.5",
+    "hypercore": "10.38.2",
+    "hypercore-crypto": "^3.6.1",
+    "hyperdrive": "^13.0.1",
+    "hyperswarm": "^4.14.0",
+    "marmot-ts": "npm:@internet-privacy/marmot-ts@0.4.0",
+    "nostr-tools": "^2.20.0",
+    "pear-interface": "^1.0.0",
+    "protomux": "^3.10.1",
+    "secp256k1": "^5.0.1",
+    "ws": "^8.18.0"
+  },
+  "overrides": {
+    "hyperbee": "2.26.5",
+    "autobase": "6.5.13",
+    "hypercore": "10.38.2",
+    "corestore": "6.18.4"
+  },
+  "devDependencies": {
+    "brittle": "^3.0.0",
+    "pear-interface": "^1.0.0"
+  }
+}
