@@ -166,8 +166,8 @@ const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd
 const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storage || join(process.cwd(), 'data')
 const userKey = process.env.USER_KEY || null
 
-function isEnvEnabled(value) {
-  if (typeof value !== 'string') return false
+function isEnvEnabled(value, defaultValue = false) {
+  if (typeof value !== 'string') return defaultValue
   const normalized = value.trim().toLowerCase()
   return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on'
 }
@@ -217,7 +217,7 @@ const JOIN_TRACE_RELAY_IDENTIFIER_HEADER = 'x-hyperpipe-relay-identifier'
 const JOIN_TRACE_ROUTE_HEADER = 'x-hyperpipe-trace-route'
 const JOIN_TRACE_PURPOSE_HEADER = 'x-hyperpipe-trace-purpose'
 const GATEWAY_REQUEST_ID_HEADER = 'x-hyperpipe-gateway-request-id'
-const JOIN_TOTAL_DEADLINE_MS = resolveTimeoutEnvMs('JOIN_TOTAL_DEADLINE_MS', 60000, {
+const JOIN_TOTAL_DEADLINE_MS = resolveTimeoutEnvMs('JOIN_TOTAL_DEADLINE_MS', null, {
   minMs: 1000,
   allowDisable: true
 })
@@ -247,7 +247,7 @@ const JOIN_EXECUTION_BUDGET_MS = resolveTimeoutEnvMs('JOIN_EXECUTION_BUDGET_MS',
 const JOIN_WRITABLE_BUDGET_MS = resolveTimeoutEnvMs('JOIN_WRITABLE_BUDGET_MS', 12000, {
   minMs: 1000
 })
-const JOIN_DIRECT_DISCOVERY_V2 = isEnvEnabled(process.env.JOIN_DIRECT_DISCOVERY_V2)
+const JOIN_DIRECT_DISCOVERY_V2 = isEnvEnabled(process.env.JOIN_DIRECT_DISCOVERY_V2, true)
 const JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT = isEnvEnabled(
   process.env.JOIN_ALLOW_OPEN_FALLBACK_AFTER_DIRECT_TIMEOUT
 )
@@ -284,11 +284,11 @@ console.info('[Worker] Join timing config', {
   relayProtocolRequestTimeoutMs:
     process.env.RELAY_PROTOCOL_REQUEST_TIMEOUT_MS && process.env.RELAY_PROTOCOL_REQUEST_TIMEOUT_MS.trim()
       ? process.env.RELAY_PROTOCOL_REQUEST_TIMEOUT_MS
-      : 'default(30000)',
+      : 'default(disabled)',
   directJoinVerifyTimeoutMs:
     process.env.DIRECT_JOIN_VERIFY_TIMEOUT_MS && process.env.DIRECT_JOIN_VERIFY_TIMEOUT_MS.trim()
       ? process.env.DIRECT_JOIN_VERIFY_TIMEOUT_MS
-      : 'default(30000)',
+      : 'default(disabled)',
   relayWriterQueueRetryIntervalMs: Number.isFinite(RELAY_WRITER_QUEUE_RETRY_INTERVAL_MS)
     ? RELAY_WRITER_QUEUE_RETRY_INTERVAL_MS
     : 'disabled',

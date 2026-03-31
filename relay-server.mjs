@@ -773,7 +773,7 @@ const DIRECT_JOIN_WRITABLE_TIMEOUT_MS = resolveTimeoutEnvMs(
 );
 const DIRECT_JOIN_VERIFY_TIMEOUT_MS = resolveTimeoutEnvMs(
   'DIRECT_JOIN_VERIFY_TIMEOUT_MS',
-  30000,
+  null,
   { minMs: 1000, allowDisable: true }
 );
 const LATE_WRITER_RECOVERY_TIMEOUT_MS = resolveTimeoutEnvMs(

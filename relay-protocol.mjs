@@ -7,7 +7,7 @@ import process from 'node:process';
 
 function resolveRequestTimeoutMs() {
   const raw = process.env.RELAY_PROTOCOL_REQUEST_TIMEOUT_MS;
-  if (typeof raw !== 'string' || !raw.trim()) return 30000;
+  if (typeof raw !== 'string' || !raw.trim()) return null;
   const normalized = raw.trim().toLowerCase();
   if (
     normalized === '0'
@@ -19,7 +19,7 @@ function resolveRequestTimeoutMs() {
     return null;
   }
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 30000;
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return Math.floor(parsed);
 }
 
