@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import b4a from 'b4a';
 import Hyperbee from 'hyperbee';
 
-import { openHyperbeeReplicationChannel } from '@hyperpipe/bridge/public-gateway/hyperbeeReplicationChannel';
+import { openHyperbeeReplicationChannel } from '@squip/hyperpipe-bridge/public-gateway/hyperbeeReplicationChannel';
 
 import { getCorestore } from '../hyperdrive-manager.mjs';
 

@@ -3,7 +3,7 @@ import { URL } from 'node:url';
 import {
   createRelayRegistration,
   createSignature
-} from '@hyperpipe/bridge/auth/PublicGatewayTokens';
+} from '@squip/hyperpipe-bridge/auth/PublicGatewayTokens';
 
 class PublicGatewayRegistrar {
   constructor({ baseUrl, sharedSecret, logger, fetchImpl = globalThis.fetch } = {}) {

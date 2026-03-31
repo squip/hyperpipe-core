@@ -65,12 +65,12 @@ import {
 import { ensureMirrorsForProviders, stopAllMirrors } from './mirror-sync-manager.mjs';
 import { NostrUtils } from './nostr-utils.js';
 import { getRelayKeyFromPublicIdentifier } from './relay-lookup-utils.mjs';
-import { loadGatewaySettings, getCachedGatewaySettings, updateGatewaySettings } from '@hyperpipe/bridge/config/GatewaySettings'
+import { loadGatewaySettings, getCachedGatewaySettings, updateGatewaySettings } from '@squip/hyperpipe-bridge/config/GatewaySettings'
 import {
   loadPublicGatewaySettings,
   updatePublicGatewaySettings,
   getCachedPublicGatewaySettings
-} from '@hyperpipe/bridge/config/PublicGatewaySettings'
+} from '@squip/hyperpipe-bridge/config/PublicGatewaySettings'
 import {
   downloadGroupFileOperation,
   deleteLocalGroupFileOperation,

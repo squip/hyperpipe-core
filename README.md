@@ -1,13 +1,13 @@
-# @hyperpipe/core
+# @squip/hyperpipe-core
 
-`@hyperpipe/core` is the first-party Hyperpipe runtime engine.
+`@squip/hyperpipe-core` is the first-party Hyperpipe runtime engine.
 
 Package contract:
 
 - the package root is side-effect free
 - the supported process entrypoint is the `hyperpipe-core` binary
 - stable public surface is limited to protocol/config helpers and versioned runtime
-  launch integration through `@hyperpipe/core-host`
+  launch integration through `@squip/hyperpipe-core-host`
 
 Internal runtime modules remain implementation details unless they are explicitly
 documented and exported as part of a future public API.

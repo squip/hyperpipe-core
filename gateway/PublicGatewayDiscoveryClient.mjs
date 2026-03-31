@@ -8,14 +8,14 @@ import {
   isAnnouncementExpired,
   verifyAnnouncementSignature,
   computeSecretHash
-} from '@hyperpipe/bridge/public-gateway/GatewayDiscovery';
+} from '@squip/hyperpipe-bridge/public-gateway/GatewayDiscovery';
 import {
   GATEWAY_ANNOUNCEMENT_KIND,
   GATEWAY_ANNOUNCEMENT_TAG,
   DEFAULT_GATEWAY_DISCOVERY_RELAYS,
   normalizeNostrRelayList,
   parseGatewayAnnouncementEvent
-} from '@hyperpipe/bridge/public-gateway/GatewayDiscoveryNostr';
+} from '@squip/hyperpipe-bridge/public-gateway/GatewayDiscoveryNostr';
 
 function normalizeUrl(value) {
   if (!value) return '';

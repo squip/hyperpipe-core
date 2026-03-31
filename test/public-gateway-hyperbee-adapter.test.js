@@ -7,7 +7,7 @@ import Hypercore from 'hypercore'
 import Hyperbee from 'hyperbee'
 import b4a from 'b4a'
 
-import PublicGatewayHyperbeeAdapter from '@hyperpipe/bridge/public-gateway/PublicGatewayHyperbeeAdapter'
+import PublicGatewayHyperbeeAdapter from '@squip/hyperpipe-bridge/public-gateway/PublicGatewayHyperbeeAdapter'
 
 const EVENTS = [
   {

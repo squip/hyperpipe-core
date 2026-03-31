@@ -76,7 +76,7 @@ import {
 } from './hyperpipe-relay-profile-manager.mjs';
 
 import { getFile, getPfpFile } from './hyperdrive-manager.mjs';
-import { loadGatewaySettings, getCachedGatewaySettings } from '@hyperpipe/bridge/config/GatewaySettings';
+import { loadGatewaySettings, getCachedGatewaySettings } from '@squip/hyperpipe-bridge/config/GatewaySettings';
 
 const PUBLIC_GATEWAY_REPLICA_IDENTIFIER = 'public-gateway:hyperbee';
 const PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED = false;

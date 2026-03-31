@@ -8,4 +8,4 @@ export {
   forwardCallbackToPeer,
   requestFileFromPeer,
   requestPfpFromPeer
-} from '@hyperpipe/bridge/public-gateway/HyperswarmClient';
+} from '@squip/hyperpipe-bridge/public-gateway/HyperswarmClient';
