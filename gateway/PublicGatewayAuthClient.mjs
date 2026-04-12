@@ -1,4 +1,4 @@
-import { schnorr } from '@noble/curves/secp256k1'
+import { schnorr } from '@noble/curves/secp256k1.js'
 
 function normalizeBaseUrl(value) {
   if (typeof value !== 'string') return null

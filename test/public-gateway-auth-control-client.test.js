@@ -1,5 +1,5 @@
 import test from 'brittle'
-import { schnorr } from '@noble/curves/secp256k1'
+import { schnorr } from '@noble/curves/secp256k1.js'
 
 import PublicGatewayAuthClient from '../gateway/PublicGatewayAuthClient.mjs'
 import PublicGatewayControlClient from '../gateway/PublicGatewayControlClient.mjs'

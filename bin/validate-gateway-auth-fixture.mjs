@@ -4,7 +4,7 @@ import { readFile, mkdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { schnorr } from '@noble/curves/secp256k1';
+import { schnorr } from '@noble/curves/secp256k1.js';
 
 const DEFAULT_MANIFEST = './test-logs/gateway-auth-fixture/manifest.json';
 const DEFAULT_SCOPE = 'gateway:relay-register';

@@ -3,7 +3,7 @@ import WebSocket from 'ws';
 import url from 'node:url';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { schnorr } from '@noble/curves/secp256k1';
+import { schnorr } from '@noble/curves/secp256k1.js';
 
 import LocalGatewayServer from './LocalGatewayServer.mjs';
 import {

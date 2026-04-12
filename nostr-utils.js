@@ -6,7 +6,7 @@
 
 // Import from local module if available, otherwise try window object
 import { nobleSecp256k1 } from './crypto-libraries.js';
-import { schnorr as nobleSchnorr } from '@noble/curves/secp256k1';
+import { schnorr as nobleSchnorr } from '@noble/curves/secp256k1.js';
 import b4a from 'b4a';
 
 export class NostrUtils {

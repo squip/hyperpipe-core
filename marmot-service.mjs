@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import nodeCrypto from 'node:crypto'
 import { serialize as v8Serialize, deserialize as v8Deserialize } from 'node:v8'
 
-import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 import { unlockGiftWrap } from 'applesauce-common/helpers/gift-wrap'
 import {
   GROUP_EVENT_KIND,

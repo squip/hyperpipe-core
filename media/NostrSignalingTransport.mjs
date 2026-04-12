@@ -1,7 +1,7 @@
 import EventEmitter from 'node:events'
 import nodeCrypto from 'node:crypto'
 
-import { bytesToHex, hexToBytes } from '@noble/hashes/utils'
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 import { SimplePool } from 'nostr-tools/pool'
 import { finalizeEvent, getPublicKey } from 'nostr-tools/pure'
 

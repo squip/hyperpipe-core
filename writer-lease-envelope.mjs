@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { schnorr } from '@noble/curves/secp256k1'
+import { schnorr } from '@noble/curves/secp256k1.js'
 
 function normalizeHex64(value) {
   if (typeof value !== 'string') return null
