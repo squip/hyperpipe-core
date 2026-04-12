@@ -19,6 +19,7 @@ import { SimplePool } from 'nostr-tools/pool';
 import { updateRelayAuthToken } from './hyperpipe-relay-profile-manager.mjs';
 import { applyPendingAuthUpdates } from './pending-auth.mjs';
 import HypercoreId from 'hypercore-id-encoding';
+import { parseNostrMessagePayload } from './relay-message-parser.mjs';
 import {
   collectRelayCoreRefsFromAutobase,
   decodeCoreRef,
@@ -331,26 +332,6 @@ export function deriveRelayDiscoveryTopic(identifier) {
   const normalized = normalizeRelayIdentifier(identifier || '');
   if (!normalized) return null;
   return sha256Hex(`hyperpipe:relay-topic:v1:${normalized}`);
-}
-
-function parseNostrMessagePayload(message) {
-  if (typeof message === 'string') {
-    const trimmed = message.trim();
-    if (!trimmed.length) {
-      throw new Error('Empty NOSTR message payload');
-    }
-    return JSON.parse(trimmed);
-  }
-
-  if (message && message.type === 'Buffer' && Array.isArray(message.data)) {
-    const messageStr = b4a.from(message.data).toString('utf8');
-    if (!messageStr.trim().length) {
-      throw new Error('Empty NOSTR message payload');
-    }
-    return JSON.parse(messageStr);
-  }
-
-  return message;
 }
 
 function getRelayWritableGate(relayKey) {

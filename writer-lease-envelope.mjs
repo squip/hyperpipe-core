@@ -17,6 +17,10 @@ function sha256Hex(input) {
   return createHash('sha256').update(String(input || ''), 'utf8').digest('hex')
 }
 
+function hexToBytes(value) {
+  return Buffer.from(String(value || ''), 'hex')
+}
+
 function canonicalizeEnvelopePayload(input = {}) {
   const leaseId = normalizeString(input.leaseId) || randomUUID()
   const relayKey = normalizeHex64(input.relayKey)
@@ -120,7 +124,9 @@ export function createWriterLeaseEnvelope(input = {}) {
   }
 
   const digest = sha256Hex(serializePayload(payload))
-  const signature = Buffer.from(schnorr.sign(digest, issuerPrivkey)).toString('hex')
+  const digestBytes = hexToBytes(digest)
+  const issuerPrivkeyBytes = hexToBytes(issuerPrivkey)
+  const signature = Buffer.from(schnorr.sign(digestBytes, issuerPrivkeyBytes)).toString('hex')
   return {
     ...payload,
     signature
@@ -160,7 +166,10 @@ export function verifyWriterLeaseEnvelope(envelope, context = {}) {
   }
 
   const digest = sha256Hex(serializePayload(payload))
-  const verified = schnorr.verify(signature, digest, payload.issuerPubkey)
+  const digestBytes = hexToBytes(digest)
+  const signatureBytes = hexToBytes(signature)
+  const issuerPubkeyBytes = hexToBytes(payload.issuerPubkey)
+  const verified = schnorr.verify(signatureBytes, digestBytes, issuerPubkeyBytes)
   if (!verified) {
     return buildVerifyResult(false, 'signature-invalid')
   }
