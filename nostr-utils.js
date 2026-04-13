@@ -10,6 +10,23 @@ import { schnorr as nobleSchnorr } from '@noble/curves/secp256k1.js';
 import b4a from 'b4a';
 
 export class NostrUtils {
+    static normalizeBytes(value, label = 'value') {
+        if (value instanceof Uint8Array) {
+            return value;
+        }
+        if (Buffer.isBuffer(value)) {
+            return new Uint8Array(value);
+        }
+        if (typeof value === 'string') {
+            const normalized = value.trim().toLowerCase();
+            if (!normalized.length || normalized.length % 2 !== 0 || /[^a-f0-9]/i.test(normalized)) {
+                throw new Error(`Invalid ${label}: expected hex string`);
+            }
+            return this.hexToBytes(normalized);
+        }
+        throw new Error(`Invalid ${label}: expected Uint8Array or hex string`);
+    }
+
     /**
      * Bech32 helpers (minimal BIP-173 implementation)
      */
@@ -93,8 +110,12 @@ export class NostrUtils {
      * @returns {Uint8Array}
      */
     static hexToBytes(hex) {
+        const normalized = String(hex || '').trim();
+        if (!normalized.length || normalized.length % 2 !== 0 || /[^a-f0-9]/i.test(normalized)) {
+            throw new Error('Invalid hex string');
+        }
         return new Uint8Array(
-            hex.match(/.{1,2}/g).map(byte => parseInt(byte, 16))
+            (normalized.match(/.{1,2}/g) || []).map(byte => parseInt(byte, 16))
         );
     }
     
@@ -162,8 +183,9 @@ export class NostrUtils {
      * @returns {string} - Hex-encoded public key (without compression prefix)
      */
     static getPublicKey(privateKey) {
+        const privateKeyBytes = this.normalizeBytes(privateKey, 'private key');
         if (nobleSchnorr?.getPublicKey) {
-            const pubKeyBytes = nobleSchnorr.getPublicKey(privateKey);
+            const pubKeyBytes = nobleSchnorr.getPublicKey(privateKeyBytes);
             return this.bytesToHex(pubKeyBytes);
         }
 
@@ -174,7 +196,7 @@ export class NostrUtils {
         }
 
         // Get the compressed public key (33 bytes)
-        const pubKeyBytes = secp.getPublicKey(privateKey, true);
+        const pubKeyBytes = secp.getPublicKey(privateKeyBytes, true);
 
         // Convert to hex and remove the compression prefix (first 2 hex chars)
         // This returns only the x-coordinate (32 bytes = 64 hex chars)
@@ -214,7 +236,10 @@ export class NostrUtils {
         }
 
         // Sign the event (schnorr.sign returns Uint8Array)
-        const sigBytes = await nobleSchnorr.sign(event.id, privateKey);
+        const sigBytes = await nobleSchnorr.sign(
+            this.normalizeBytes(event.id, 'event id'),
+            this.normalizeBytes(privateKey, 'private key')
+        );
         event.sig = this.bytesToHex(sigBytes);
         
         return event;
@@ -259,9 +284,9 @@ export class NostrUtils {
             // Note: Schnorr signatures in Nostr use x-only pubkeys (32 bytes)
             // So we don't need to add the '02' prefix
             return nobleSchnorr.verify(
-                event.sig,
-                event.id,
-                event.pubkey
+                this.normalizeBytes(event.sig, 'signature'),
+                this.normalizeBytes(event.id, 'event id'),
+                this.normalizeBytes(event.pubkey, 'pubkey')
             );
         } catch (error) {
             console.error('Error verifying signature:', error);

@@ -1653,7 +1653,7 @@ export class MarmotService {
   async deriveInvitePreview(invite, previewClient) {
     if (!invite?.welcomeRumor || !previewClient || !this.network) return null
 
-    const group = await previewClient.joinGroupFromWelcome({
+    const { group } = await previewClient.joinGroupFromWelcome({
       welcomeRumor: invite.welcomeRumor,
       keyPackageEventId: invite.keyPackageEventId || undefined
     })
@@ -2504,7 +2504,7 @@ export class MarmotService {
     let conversationId = null
 
     try {
-      const group = await this.client.joinGroupFromWelcome({
+      const { group } = await this.client.joinGroupFromWelcome({
         welcomeRumor: normalizedWelcomeRumor,
         keyPackageEventId: invite.keyPackageEventId || undefined
       })
@@ -2860,14 +2860,22 @@ export class MarmotService {
       }
 
       case 'marmot-list-conversations': {
-        await this.syncAll({ emit: false, reason: 'list-conversations' })
+        this.syncAll({ emit: true, reason: 'list-conversations' }).catch((error) => {
+          this.logger.warn('[MarmotService] background conversation sync failed', {
+            error: error?.message || error
+          })
+        })
         return {
           conversations: this.listConversationSummaries({ search: payload.search || '' })
         }
       }
 
       case 'marmot-list-invites': {
-        await this.syncInvites({ emit: false })
+        this.syncAll({ emit: true, reason: 'list-invites' }).catch((error) => {
+          this.logger.warn('[MarmotService] background invite sync failed', {
+            error: error?.message || error
+          })
+        })
         return {
           invites: this.listInvites({ search: payload.search || '' })
         }
