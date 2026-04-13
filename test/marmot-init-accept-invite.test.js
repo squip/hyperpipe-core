@@ -194,7 +194,7 @@ test('runAcceptInviteOperation emits joinedConversation before sync completion',
   service.schedulePersist = () => {}
   service.invitesById.set('invite-1', buildInvite('invite-1'))
   service.client = {
-    joinGroupFromWelcome: async () => group,
+    joinGroupFromWelcome: async () => ({ group }),
     getGroup: async () => group
   }
   service.buildConversationSummary = (value) => buildConversationSummary(service, value)
@@ -282,7 +282,7 @@ test('runAcceptInviteOperation keeps the invite joined when post-join sync fails
   service.schedulePersist = () => {}
   service.invitesById.set('invite-2', buildInvite('invite-2'))
   service.client = {
-    joinGroupFromWelcome: async () => group,
+    joinGroupFromWelcome: async () => ({ group }),
     getGroup: async () => group
   }
   service.buildConversationSummary = (value) => buildConversationSummary(service, value)
@@ -351,7 +351,7 @@ test('runAcceptInviteOperation repairs legacy raw welcome rumors before joining'
     joinGroupFromWelcome: async ({ welcomeRumor }) => {
       const welcome = getWelcome(welcomeRumor)
       t.is(welcome.secrets.length, 1)
-      return group
+      return { group }
     },
     getGroup: async () => group
   }
