@@ -213,3 +213,45 @@ test('createConversationShell uses the selected relays as the authoritative publ
   t.is(shell.conversation.id, 'conv-shell-2')
   t.alike(receivedRelays, ['wss://custom-relay.test/'])
 })
+
+test('inviteMembers reports a failure when welcome delivery is not acknowledged by any relay', async (t) => {
+  const service = new MarmotService({
+    storageRoot: '/tmp/hyperpipe-worker-test',
+    getConfig: () => ({}),
+    sendMessage: () => {},
+    logger: createLogger()
+  })
+
+  const group = {
+    idStr: 'conv-invite-ack',
+    inviteByKeyPackageEvent: async () => ({
+      'wss://relay.test': {
+        ok: false,
+        message: 'publish timed out'
+      }
+    })
+  }
+
+  service.pubkey = hex64('a')
+  service.relays = ['wss://relay.test']
+  service.schedulePersist = () => {}
+  service.groupsById.set(group.idStr, group)
+  service.fetchLatestKeyPackageEvent = async () => ({
+    id: 'key-package-1',
+    kind: 443,
+    pubkey: hex64('b')
+  })
+  service.buildConversationSummary = () => ({
+    id: group.idStr,
+    protocol: 'marmot'
+  })
+  service.emitConversationUpdated = async () => {}
+
+  const result = await service.inviteMembers(group.idStr, [hex64('b')])
+
+  t.alike(result.invited, [])
+  t.is(result.failed.length, 1)
+  t.is(result.failed[0].pubkey, hex64('b'))
+  t.ok(result.failed[0].error.includes('not acknowledged'))
+  t.ok(result.failed[0].error.includes('publish timed out'))
+})

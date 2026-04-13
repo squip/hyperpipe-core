@@ -14,16 +14,19 @@ import {
   MarmotClient,
   Proposals,
   WELCOME_EVENT_KIND,
-  createCredential,
-  createKeyPackageEvent,
+  createWelcomeRumor,
+  decodeContent,
   createKeyPackageRelayListEvent,
   deserializeApplicationRumor,
-  generateKeyPackage,
+  getWelcome,
+  hasAck,
   getGroupMembers
 } from 'marmot-ts'
 import * as nip44 from 'nostr-tools/nip44'
 import { SimplePool } from 'nostr-tools/pool'
 import { finalizeEvent, getEventHash, getPublicKey } from 'nostr-tools/pure'
+import { decode } from 'ts-mls'
+import { welcomeDecoder } from 'ts-mls/welcome.js'
 
 const GIFT_WRAP_KIND = 1059
 const MESSAGE_KIND_TEXT = 14
@@ -169,6 +172,75 @@ function readTag(tags, name) {
   return row && typeof row[1] === 'string' ? row[1] : undefined
 }
 
+function listWelcomeRelays(welcomeRumor) {
+  const relaysTag = ensureArray(welcomeRumor?.tags).find(
+    (tag) => Array.isArray(tag) && tag[0] === 'relays'
+  )
+
+  return relaysTag ? relaysTag.slice(1).filter((value) => typeof value === 'string') : []
+}
+
+function formatPublishAckFailure(publishResult = {}) {
+  const failures = Object.entries(publishResult)
+    .map(([relay, result]) => {
+      if (result?.ok) return null
+      const message =
+        typeof result?.message === 'string' && result.message.trim()
+          ? result.message.trim()
+          : 'no relay acknowledged'
+      return `${relay}: ${message}`
+    })
+    .filter(Boolean)
+
+  return failures.length ? failures.join('; ') : 'no relay acknowledged'
+}
+
+function normalizeWelcomeRumorPayload(welcomeRumor) {
+  if (!welcomeRumor || typeof welcomeRumor !== 'object') return welcomeRumor
+  if (Number(welcomeRumor.kind) !== WELCOME_EVENT_KIND) return welcomeRumor
+
+  try {
+    getWelcome(welcomeRumor)
+    return welcomeRumor
+  } catch {
+    const encoding = readTag(welcomeRumor.tags, 'encoding')
+    if (encoding !== 'base64') return welcomeRumor
+
+    let rawWelcome = null
+    try {
+      rawWelcome = decode(welcomeDecoder, decodeContent(welcomeRumor.content, encoding))
+    } catch {
+      return welcomeRumor
+    }
+
+    if (!rawWelcome) return welcomeRumor
+
+    const repaired = createWelcomeRumor({
+      welcome: rawWelcome,
+      author: normalizePubkey(welcomeRumor.pubkey) || welcomeRumor.pubkey,
+      groupRelays: listWelcomeRelays(welcomeRumor),
+      keyPackageEventId: readTag(welcomeRumor.tags, 'e')
+    })
+
+    const next = {
+      ...welcomeRumor,
+      content: repaired.content,
+      tags: repaired.tags
+    }
+
+    return {
+      ...next,
+      id: getEventHash({
+        kind: Number(next.kind),
+        pubkey: next.pubkey,
+        created_at: Number(next.created_at) || nowSeconds(),
+        content: next.content,
+        tags: next.tags
+      })
+    }
+  }
+}
+
 function summarizeFilter(filter = {}) {
   if (!filter || typeof filter !== 'object') return {}
   const summary = {}
@@ -302,6 +374,26 @@ class FileKeyValueBackend {
       await fs.unlink(this.pathForKey(key))
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error
+    }
+  }
+
+  async quarantineItem(key, reason = 'corrupt') {
+    await this.ensureDir()
+    const filePath = this.pathForKey(key)
+    const quarantineDir = join(this.baseDir, '..', 'group-state-quarantine')
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const targetPath = join(
+      quarantineDir,
+      `${encodeURIComponent(String(key))}.${reason}.${timestamp}.bin`
+    )
+
+    try {
+      await fs.mkdir(quarantineDir, { recursive: true })
+      await fs.rename(filePath, targetPath)
+      return targetPath
+    } catch (error) {
+      if (error?.code === 'ENOENT') return null
+      throw error
     }
   }
 
@@ -582,6 +674,7 @@ export class MarmotService {
 
     this.client = null
     this.network = null
+    this.groupStateStorageBackend = null
 
     this.groupsById = new Map()
     this.messagesByConversation = new Map()
@@ -596,6 +689,7 @@ export class MarmotService {
     this.persistTimer = null
     this.persistInFlight = null
     this.lastKeyPackagePublishedAt = 0
+    this.corruptGroupStateIds = new Set()
 
     this.stateFile = join(storageRoot, 'marmot', 'state.json')
   }
@@ -880,7 +974,7 @@ export class MarmotService {
       : 'pending'
 
     const welcomeRumor = input.welcomeRumor && typeof input.welcomeRumor === 'object'
-      ? input.welcomeRumor
+      ? normalizeWelcomeRumorPayload(input.welcomeRumor)
       : null
     const memberPubkeys = normalizePubkeyList(input.memberPubkeys || [])
 
@@ -1001,9 +1095,8 @@ export class MarmotService {
         logger: this.logger
       })
 
-      const groupStateBackend = new KeyValueGroupStateBackend(
-        new FileKeyValueBackend(join(this.storageRoot, 'marmot', 'group-state'))
-      )
+      this.groupStateStorageBackend = new FileKeyValueBackend(join(this.storageRoot, 'marmot', 'group-state'))
+      const groupStateBackend = new KeyValueGroupStateBackend(this.groupStateStorageBackend)
       const keyPackageStore = new KeyPackageStore(
         new FileKeyValueBackend(join(this.storageRoot, 'marmot', 'key-packages'))
       )
@@ -1082,11 +1175,66 @@ export class MarmotService {
 
   async refreshGroupsMap() {
     if (!this.client) return
-    const groups = await this.client.loadAllGroups()
     this.groupsById.clear()
-    for (const group of groups) {
-      this.groupsById.set(group.idStr, group)
+
+    const groupIds = await this.client.groupStateStore.list()
+    for (const groupId of groupIds) {
+      try {
+        const group = await this.client.getGroup(groupId)
+        if (group?.idStr) {
+          this.groupsById.set(group.idStr, group)
+        }
+      } catch (error) {
+        if (this.isRecoverableClientStateError(error)) {
+          await this.quarantineCorruptGroupState(groupId, error)
+          continue
+        }
+        throw error
+      }
     }
+  }
+
+  isRecoverableClientStateError(error) {
+    const message = error?.message || String(error || '')
+    return message.includes('Failed to deserialize ClientState')
+  }
+
+  async quarantineCorruptGroupState(groupId, error) {
+    const normalizedGroupId =
+      typeof groupId === 'string'
+        ? groupId
+        : groupId instanceof Uint8Array
+          ? bytesToHex(groupId)
+          : String(groupId || '')
+    if (!normalizedGroupId) return
+    if (this.corruptGroupStateIds.has(normalizedGroupId)) return
+    this.corruptGroupStateIds.add(normalizedGroupId)
+
+    let quarantinedPath = null
+    try {
+      quarantinedPath = await this.groupStateStorageBackend?.quarantineItem(
+        normalizedGroupId,
+        'deserialize-failure'
+      )
+    } catch (quarantineError) {
+      this.logger.warn?.('[MarmotService] Failed to quarantine corrupt group state', {
+        groupId: normalizedGroupId,
+        error: quarantineError?.message || quarantineError
+      })
+    }
+
+    try {
+      this.client?.clearGroupInstance?.(groupId)
+    } catch {}
+
+    this.groupsById.delete(normalizedGroupId)
+    this.lastSyncAtByConversation.delete(normalizedGroupId)
+
+    this.logger.warn?.('[MarmotService] Quarantined unreadable local Marmot group state', {
+      groupId: normalizedGroupId,
+      error: error?.message || error,
+      quarantinedPath
+    })
   }
 
   async ensureLocalKeyPackagePublished() {
@@ -1095,28 +1243,22 @@ export class MarmotService {
     const now = Date.now()
     if (now - this.lastKeyPackagePublishedAt < 30_000) return
 
-    const existingPackages = await this.client.keyPackageStore.list()
+    const existingPackages = await this.client.keyPackages.list()
+    const publishedPackages = existingPackages.filter(
+      (keyPackage) => Array.isArray(keyPackage.published) && keyPackage.published.length > 0
+    )
+
     if (!existingPackages.length) {
-      const credential = createCredential(this.pubkey)
-      const ciphersuiteImpl = await this.client.getCiphersuiteImpl()
-      const completeKeyPackage = await generateKeyPackage({
-        credential,
-        ciphersuiteImpl
+      await this.client.keyPackages.create({
+        relays: this.relays,
+        client: 'hyperpipe-worker'
       })
-      await this.client.keyPackageStore.add(completeKeyPackage)
+    } else if (!publishedPackages.length) {
+      await this.client.keyPackages.rotate(existingPackages[0].keyPackageRef, {
+        relays: this.relays,
+        client: 'hyperpipe-worker'
+      })
     }
-
-    const allPackages = await this.client.keyPackageStore.list()
-    if (!allPackages.length) return
-
-    const keyPackage = allPackages[0].publicPackage
-    const keyPackageEvent = createKeyPackageEvent({
-      keyPackage,
-      pubkey: this.pubkey,
-      relays: this.relays
-    })
-    const signedKeyPackageEvent = await this.signer.signEvent(keyPackageEvent)
-    await this.network.publish(this.relays, signedKeyPackageEvent)
 
     await this.publishKeyPackageRelayList()
     this.lastKeyPackagePublishedAt = now
@@ -1495,11 +1637,11 @@ export class MarmotService {
       keyPackageStore: previewKeyPackageStore
     })
 
-    const localKeyPackages = await this.client.keyPackageStore.list()
+    const localKeyPackages = await this.client.keyPackages.list()
     for (const listedPackage of localKeyPackages) {
-      const privatePackage = await this.client.keyPackageStore.getPrivateKey(listedPackage.keyPackageRef)
+      const privatePackage = await this.client.keyPackages.getPrivateKey(listedPackage.keyPackageRef)
       if (!privatePackage) continue
-      await previewClient.keyPackageStore.add({
+      await previewKeyPackageStore.add({
         publicPackage: listedPackage.publicPackage,
         privatePackage
       })
@@ -2010,7 +2152,12 @@ export class MarmotService {
     for (const memberPubkey of normalizedMembers) {
       try {
         const keyPackageEvent = await this.fetchLatestKeyPackageEvent(memberPubkey)
-        await group.inviteByKeyPackageEvent(keyPackageEvent)
+        const publishResult = await group.inviteByKeyPackageEvent(keyPackageEvent)
+        if (!hasAck(publishResult)) {
+          throw new Error(
+            `Welcome publish was not acknowledged by any relay (${formatPublishAckFailure(publishResult)})`
+          )
+        }
         invited.push(memberPubkey)
       } catch (error) {
         failed.push({
@@ -2334,6 +2481,17 @@ export class MarmotService {
       throw error
     }
 
+    const normalizedWelcomeRumor = normalizeWelcomeRumorPayload(invite.welcomeRumor)
+    if (normalizedWelcomeRumor !== invite.welcomeRumor) {
+      invite.welcomeRumor = normalizedWelcomeRumor
+      this.invitesById.set(inviteId, invite)
+      this.schedulePersist()
+      this.logger.info?.('[MarmotService] repaired legacy welcome rumor payload', {
+        inviteId,
+        welcomeId: normalizedWelcomeRumor?.id || null
+      })
+    }
+
     invite.status = 'joining'
     invite.error = null
     this.invitesById.set(inviteId, invite)
@@ -2347,7 +2505,7 @@ export class MarmotService {
 
     try {
       const group = await this.client.joinGroupFromWelcome({
-        welcomeRumor: invite.welcomeRumor,
+        welcomeRumor: normalizedWelcomeRumor,
         keyPackageEventId: invite.keyPackageEventId || undefined
       })
 
