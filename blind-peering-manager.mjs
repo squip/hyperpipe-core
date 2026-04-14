@@ -121,7 +121,6 @@ export default class BlindPeeringManager extends EventEmitter {
     this.enabled = false;
     this.started = false;
     this.lastAnnouncedBlindPeerPublicKey = null;
-    this.lastSnapshotNotifiedBlindPeerPublicKey = null;
     this.handshakeMirrors = new Set();
     this.manualMirrors = new Set();
     this.trustedMirrors = new Set();
@@ -1560,22 +1559,6 @@ export default class BlindPeeringManager extends EventEmitter {
     }).length;
 
     const localBlindPeerPublicKey = this.getLocalBlindPeerPublicKey();
-    if (
-      localBlindPeerPublicKey
-      && localBlindPeerPublicKey !== this.lastSnapshotNotifiedBlindPeerPublicKey
-    ) {
-      this.lastSnapshotNotifiedBlindPeerPublicKey = localBlindPeerPublicKey;
-      if (this.onLocalIdentityAvailable) {
-        try {
-          this.onLocalIdentityAvailable(localBlindPeerPublicKey);
-        } catch (error) {
-          this.logger?.warn?.('[BlindPeering] Failed to notify local identity listener from transport snapshot', {
-            error: error?.message || error
-          });
-        }
-      }
-      this.emit('local-key-available', localBlindPeerPublicKey);
-    }
     const blindPeerClients = this.#collectBlindPeerClientSummary({ limit: normalizedLimit });
 
     return {
