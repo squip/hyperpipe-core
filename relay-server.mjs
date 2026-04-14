@@ -351,6 +351,7 @@ function getRelayWritableGate(relayKey) {
 let config = null;
 let swarm = null;
 let gatewayRegistrationInterval = null;
+let blindPeerGatewayRegistrationRetryTimer = null;
 let gatewayConnection = null;
 let relayServerShuttingDown = false;
 let pendingRegistrations = []; // Queue registrations until gateway connects
@@ -806,6 +807,75 @@ function buildGatewayWebsocketBase(cfg = config) {
   return `${protocol}://${host}`;
 }
 
+function getLocalBlindPeeringPublicKey() {
+  const manager = global.blindPeeringManager;
+  if (!manager?.enabled || typeof manager.getLocalBlindPeerPublicKey !== 'function') {
+    return null;
+  }
+  try {
+    const blindPeeringPublicKey = manager.getLocalBlindPeerPublicKey();
+    return typeof blindPeeringPublicKey === 'string' && blindPeeringPublicKey.trim()
+      ? blindPeeringPublicKey.trim()
+      : null;
+  } catch (error) {
+    console.warn('[RelayServer] Failed to resolve local blind peering identity:', error?.message || error);
+    return null;
+  }
+}
+
+function scheduleBlindPeerGatewayRegistrationRetry(reason = 'blind-peer-key-pending', delayMs = 1500) {
+  if (blindPeerGatewayRegistrationRetryTimer || relayServerShuttingDown) return;
+  const timeoutMs = Number.isFinite(delayMs) ? Math.max(250, Math.trunc(delayMs)) : 1500;
+  blindPeerGatewayRegistrationRetryTimer = setInterval(async () => {
+    if (!config?.registerWithGateway || relayServerShuttingDown) {
+      clearInterval(blindPeerGatewayRegistrationRetryTimer);
+      blindPeerGatewayRegistrationRetryTimer = null;
+      return;
+    }
+    const blindPeeringPublicKey = getLocalBlindPeeringPublicKey();
+    if (!blindPeeringPublicKey) {
+      console.log('[RelayServer] Blind peering gateway registration retry waiting for local identity', {
+        reason
+      });
+      return;
+    }
+    if (!gatewayConnection) {
+      console.log('[RelayServer] Blind peering gateway registration retry waiting for gateway connection', {
+        reason,
+        blindPeeringPublicKey: blindPeeringPublicKey.slice(0, 16)
+      });
+      return;
+    }
+    console.log('[RelayServer] Blind peering identity became available; refreshing gateway registration', {
+      reason,
+      blindPeeringPublicKey: blindPeeringPublicKey.slice(0, 16)
+    });
+    try {
+      const result = await registerWithGateway(null, {
+        skipQueue: true,
+        reason: `${reason}-registration-refresh`
+      });
+      console.log('[RelayServer] Blind peering gateway registration refresh result', {
+        reason,
+        acknowledged: result?.acknowledged === true,
+        queued: result?.queued === true,
+        skipped: result?.skipped === true,
+        skippedReason: result?.reason || null
+      });
+      if (result?.queued === true || result?.skipped === true) {
+        return;
+      }
+      clearInterval(blindPeerGatewayRegistrationRetryTimer);
+      blindPeerGatewayRegistrationRetryTimer = null;
+    } catch (error) {
+      console.warn('[RelayServer] Blind peering gateway registration refresh failed:', error?.message || error);
+    }
+  }, timeoutMs);
+  if (typeof blindPeerGatewayRegistrationRetryTimer?.unref === 'function') {
+    blindPeerGatewayRegistrationRetryTimer.unref();
+  }
+}
+
 function buildCanonicalRelayUrl(identifier, authToken = null, cfg = config) {
   const normalizedIdentifier = normalizeRelayIdentifier(identifier || '') || String(identifier || '').trim();
   if (!normalizedIdentifier) return null;
@@ -865,6 +935,25 @@ export function applyRuntimeGatewayEndpoint({
     gatewayUrl: config.gatewayUrl || null,
     proxyServerAddress: config.proxy_server_address || null,
     proxyWebsocketProtocol: config.proxy_websocket_protocol || null
+  };
+}
+
+export function applyRuntimeBlindPeeringIdentity({ blindPeeringPublicKey = null } = {}) {
+  if (!config || typeof config !== 'object') {
+    return { applied: false, reason: 'config-uninitialized' };
+  }
+  const normalizedBlindPeeringPublicKey =
+    typeof blindPeeringPublicKey === 'string' && blindPeeringPublicKey.trim()
+      ? blindPeeringPublicKey.trim()
+      : null;
+  if (!normalizedBlindPeeringPublicKey) {
+    delete config.blindPeeringPublicKey;
+    return { applied: false, reason: 'blind-peer-key-missing' };
+  }
+  config.blindPeeringPublicKey = normalizedBlindPeeringPublicKey;
+  return {
+    applied: true,
+    blindPeeringPublicKey: normalizedBlindPeeringPublicKey
   };
 }
 
@@ -6002,7 +6091,7 @@ function updateMetrics(success = true) {
 }
 
 // Register with gateway using Hyperswarm
-async function registerWithGateway(relayProfileInfo = null, options = {}) {
+export async function registerWithGateway(relayProfileInfo = null, options = {}) {
   const {
     skipQueue = false,
     requestTimeoutMs = GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS,
@@ -6029,6 +6118,14 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
   if (!publicKey) {
     console.warn('[RelayServer] Cannot register with gateway - swarm public key unavailable');
     return { skipped: true };
+  }
+
+  const blindPeeringPublicKey =
+    (typeof config?.blindPeeringPublicKey === 'string' && config.blindPeeringPublicKey.trim())
+      ? config.blindPeeringPublicKey.trim()
+      : getLocalBlindPeeringPublicKey();
+  if (!blindPeeringPublicKey && global.blindPeeringManager?.enabled) {
+    scheduleBlindPeerGatewayRegistrationRetry(reason);
   }
 
   try {
@@ -6143,7 +6240,13 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
         isPublic: resolvedIsPublic,
         metadataUpdatedAt: resolvedMetadata?.updatedAt || toTimestamp(profile?.updated_at),
         metadataEventId: resolvedMetadata?.eventId || null,
-        gatewayPath: identifierPath
+        gatewayPath: identifierPath,
+        ...(blindPeeringPublicKey ? {
+          blindPeeringPublicKey,
+          metadata: {
+            blindPeeringPublicKey
+          }
+        } : {})
       });
     }
 
@@ -6236,7 +6339,13 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
       mode: 'hyperswarm',
       timestamp: new Date().toISOString(),
       nostrPubkeyHex: config.nostr_pubkey_hex || null,
-      pfpDriveKey: config.pfpDriveKey || null
+      pfpDriveKey: config.pfpDriveKey || null,
+      ...(blindPeeringPublicKey ? {
+        blindPeeringPublicKey,
+        metadata: {
+          blindPeeringPublicKey
+        }
+      } : {})
     };
 
     if (PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED && replicaInfo) {
@@ -6312,7 +6421,13 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
           isPublic: newRelayIsPublic,
           metadataUpdatedAt: resolvedNewMetadata?.updatedAt || toTimestamp(relayProfileInfo.updated_at),
           metadataEventId: resolvedNewMetadata?.eventId || null,
-          gatewayPath: identifierPath
+          gatewayPath: identifierPath,
+          ...(blindPeeringPublicKey ? {
+            blindPeeringPublicKey,
+            metadata: {
+              blindPeeringPublicKey
+            }
+          } : {})
         };
       }
     }
@@ -6355,6 +6470,7 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
       address: registrationData.address,
       hasNewRelay: !!registrationData.newRelay,
       mode: registrationData.mode,
+      blindPeeringPublicKey: blindPeeringPublicKey ? blindPeeringPublicKey.slice(0, 16) : null,
       reason,
       requestTimeoutMs
     });
@@ -6452,7 +6568,13 @@ async function registerWithGateway(relayProfileInfo = null, options = {}) {
 
     console.log('[RelayServer] Registration SUCCESSFUL');
     console.log('[RelayServer] ========================================');
-    return { acknowledged: true, ack };
+    return {
+      acknowledged: true,
+      ack,
+      relayCount: registrationData.relays.length,
+      hasNewRelay: !!registrationData.newRelay,
+      blindPeeringPublicKey: blindPeeringPublicKey || null
+    };
   } catch (error) {
     const errorMessage = error?.message || String(error);
     const timeoutLike = /timeout/i.test(errorMessage);
@@ -8846,6 +8968,11 @@ export async function shutdownRelayServer() {
   if (gatewayRegistrationInterval) {
     clearInterval(gatewayRegistrationInterval);
     gatewayRegistrationInterval = null;
+  }
+
+  if (blindPeerGatewayRegistrationRetryTimer) {
+    clearTimeout(blindPeerGatewayRegistrationRetryTimer);
+    blindPeerGatewayRegistrationRetryTimer = null;
   }
 
   if (healthMonitorTimer) {

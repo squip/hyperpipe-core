@@ -644,6 +644,16 @@ export class GatewayService extends EventEmitter {
     gatewayId = null,
     allowSettingsFallback = true
   } = {}) {
+    const settings = this.publicGatewaySettings || null;
+    const settingsOrigin = allowSettingsFallback
+      ? this.#normalizeGatewayOrigin(settings?.baseUrl || null)
+      : null;
+    const settingsSelectionMode = typeof settings?.selectionMode === 'string'
+      ? settings.selectionMode
+      : null;
+    const normalizedSettingsGatewayId = allowSettingsFallback
+      ? this.#normalizeGatewayId(settings?.resolvedGatewayId || null)
+      : null;
     const normalizedOrigin = this.#normalizeGatewayOrigin(
       gatewayOrigin
       || metadata?.gatewayOrigin
@@ -667,31 +677,62 @@ export class GatewayService extends EventEmitter {
       normalizedGatewayId = this.#normalizeGatewayId(entry.gatewayId);
     }
 
+    const manualSettingsMatch = settingsSelectionMode === 'manual'
+      && settingsOrigin
+      && (!normalizedOrigin || normalizedOrigin === settingsOrigin);
+
+    if (manualSettingsMatch && !normalizedGatewayId && normalizedSettingsGatewayId) {
+      normalizedGatewayId = normalizedSettingsGatewayId;
+    }
+
     const routeOrigin = this.#normalizeGatewayOrigin(
-      normalizedOrigin
-      || entry?.publicUrl
-      || (allowSettingsFallback ? this.publicGatewaySettings?.baseUrl : null)
+      manualSettingsMatch
+        ? settingsOrigin
+        : (
+          normalizedOrigin
+          || entry?.publicUrl
+          || settingsOrigin
+        )
     );
     if (!routeOrigin) {
       return null;
     }
 
-    const authMethod = this.#inferGatewayAuthMethod(entry);
-    let sharedSecret = typeof entry?.sharedSecret === 'string' && entry.sharedSecret.trim()
-      ? entry.sharedSecret.trim()
-      : null;
-    if (!sharedSecret
-      && authMethod !== 'relay-scoped-bearer-v1'
-      && normalizedGatewayId
-      && this.discoveryClient?.ensureSecret) {
-      try {
-        await this.discoveryClient.ensureSecret(normalizedGatewayId);
-        entry = this.#findDiscoveredGateway({ gatewayId: normalizedGatewayId, gatewayOrigin: routeOrigin });
-        sharedSecret = typeof entry?.sharedSecret === 'string' && entry.sharedSecret.trim()
-          ? entry.sharedSecret.trim()
-          : null;
-      } catch (error) {
-        this.log('debug', `[PublicGateway] Secret fetch skipped for ${normalizedGatewayId}: ${error.message}`);
+    let authMethod;
+    let sharedSecret = null;
+    if (manualSettingsMatch) {
+      authMethod = typeof settings?.resolvedAuthMethod === 'string' && settings.resolvedAuthMethod.trim()
+        ? settings.resolvedAuthMethod.trim()
+        : (
+          typeof settings?.authMethod === 'string' && settings.authMethod.trim()
+            ? settings.authMethod.trim()
+            : (typeof settings?.sharedSecret === 'string' && settings.sharedSecret.trim()
+                ? 'shared-secret-v1'
+                : 'relay-scoped-bearer-v1')
+        );
+      sharedSecret = authMethod !== 'relay-scoped-bearer-v1'
+        && typeof settings?.sharedSecret === 'string'
+        && settings.sharedSecret.trim()
+        ? settings.sharedSecret.trim()
+        : null;
+    } else {
+      authMethod = this.#inferGatewayAuthMethod(entry);
+      sharedSecret = typeof entry?.sharedSecret === 'string' && entry.sharedSecret.trim()
+        ? entry.sharedSecret.trim()
+        : null;
+      if (!sharedSecret
+        && authMethod !== 'relay-scoped-bearer-v1'
+        && normalizedGatewayId
+        && this.discoveryClient?.ensureSecret) {
+        try {
+          await this.discoveryClient.ensureSecret(normalizedGatewayId);
+          entry = this.#findDiscoveredGateway({ gatewayId: normalizedGatewayId, gatewayOrigin: routeOrigin });
+          sharedSecret = typeof entry?.sharedSecret === 'string' && entry.sharedSecret.trim()
+            ? entry.sharedSecret.trim()
+            : null;
+        } catch (error) {
+          this.log('debug', `[PublicGateway] Secret fetch skipped for ${normalizedGatewayId}: ${error.message}`);
+        }
       }
     }
 

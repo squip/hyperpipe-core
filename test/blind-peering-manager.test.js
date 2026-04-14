@@ -78,3 +78,67 @@ test('blind peering manager merges manual and dispatcher metadata', async t => {
   t.ok(snapshot)
   t.is(typeof status.refreshBackoff, 'object')
 })
+
+test('blind peering manager exposes a local blind peer key after start', async t => {
+  const manager = new BlindPeeringManager({
+    logger: quietLogger,
+    settingsProvider: () => ({
+      blindPeerEnabled: true,
+      blindPeerKeys: []
+    })
+  })
+
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'blind-peering-local-key-'))
+  const store = new Corestore(tmp)
+  const announcedKeys = []
+
+  manager.on('local-key-available', (key) => {
+    announcedKeys.push(key)
+  })
+
+  manager.configure()
+  await manager.start({ corestore: store })
+
+  const localBlindPeerKey = manager.getLocalBlindPeerPublicKey()
+  t.is(typeof localBlindPeerKey, 'string')
+  t.ok(localBlindPeerKey.length > 0)
+  t.alike(announcedKeys, [localBlindPeerKey])
+
+  await manager.stop()
+  await store.close()
+  await fs.rm(tmp, { recursive: true, force: true })
+})
+
+test('blind peering manager falls back to active blind peer stream key when default keypair is unavailable', t => {
+  const manager = new BlindPeeringManager({
+    logger: quietLogger,
+    settingsProvider: () => ({
+      blindPeerEnabled: true,
+      blindPeerKeys: []
+    })
+  })
+
+  const streamKey = HypercoreId.encode(Buffer.alloc(32, 7))
+  const announcedKeys = []
+
+  manager.started = true
+  manager.blindPeering = {
+    blindPeersByKey: new Map([
+      ['mirror-a', {
+        peer: {
+          stream: {
+            publicKey: HypercoreId.decode(streamKey)
+          }
+        }
+      }]
+    ])
+  }
+
+  manager.on('local-key-available', (key) => {
+    announcedKeys.push(key)
+  })
+
+  const localBlindPeerKey = manager.getLocalBlindPeerPublicKey()
+  t.is(localBlindPeerKey, streamKey)
+  t.alike(announcedKeys, [streamKey])
+})

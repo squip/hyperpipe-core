@@ -124,6 +124,36 @@ function uniqueRelays(input = [], { includeDefaults = true } = {}) {
   return out
 }
 
+function resolveNostrGroupEventId(group) {
+  const nostrGroupId = group?.groupData?.nostrGroupId
+  if (nostrGroupId instanceof Uint8Array && nostrGroupId.length > 0) {
+    return bytesToHex(nostrGroupId)
+  }
+  if (Array.isArray(nostrGroupId) && nostrGroupId.length > 0) {
+    try {
+      return bytesToHex(Uint8Array.from(nostrGroupId))
+    } catch {
+      // fall through to the local group id
+    }
+  }
+  return typeof group?.idStr === 'string' ? group.idStr : null
+}
+
+function eventMatchesGroupEventId(event, groupEventId) {
+  const normalizedGroupEventId = sanitizeString(groupEventId, 256)?.toLowerCase() || null
+  if (!normalizedGroupEventId) return false
+  for (const tag of ensureArray(event?.tags)) {
+    if (!Array.isArray(tag) || tag[0] !== 'h') continue
+    const candidate = sanitizeString(tag[1], 256)?.toLowerCase() || null
+    if (candidate === normalizedGroupEventId) return true
+  }
+  return false
+}
+
+function filterEventsByGroupEventId(events, groupEventId) {
+  return ensureArray(events).filter((event) => eventMatchesGroupEventId(event, groupEventId))
+}
+
 function normalizePubkey(pubkey) {
   if (typeof pubkey !== 'string') return null
   const trimmed = pubkey.trim().toLowerCase()
@@ -165,6 +195,31 @@ function sortEventsChronological(events) {
     if (aTs !== bTs) return aTs - bTs
     return String(a?.id || '').localeCompare(String(b?.id || ''))
   })
+}
+
+function readApplicationRumorFromIngestResult(result) {
+  if (!result || typeof result !== 'object') return null
+
+  let messageBytes = null
+  if (result.kind === 'applicationMessage') {
+    messageBytes = result.message
+  } else if (
+    result.kind === 'processed'
+    && result.result
+    && typeof result.result === 'object'
+    && result.result.kind === 'applicationMessage'
+  ) {
+    messageBytes = result.result.message
+  }
+
+  if (!(messageBytes instanceof Uint8Array)) return null
+
+  try {
+    const rumor = deserializeApplicationRumor(messageBytes)
+    return rumor && rumor.id ? rumor : null
+  } catch {
+    return null
+  }
 }
 
 function readTag(tags, name) {
@@ -1670,17 +1725,24 @@ export class MarmotService {
     }
 
     const relays = uniqueRelays(group.relays || this.relays)
+    const groupEventId = resolveNostrGroupEventId(group)
     try {
-      const events = await this.network.request(relays, {
+      let events = await this.network.request(relays, {
         kinds: [GROUP_EVENT_KIND],
-        '#h': [group.idStr],
+        '#h': groupEventId ? [groupEventId] : [group.idStr],
         limit: 400
       })
+      if (!events.length && groupEventId) {
+        const fallbackEvents = await this.network.request(relays, {
+          kinds: [GROUP_EVENT_KIND],
+          limit: 400
+        })
+        events = filterEventsByGroupEventId(fallbackEvents, groupEventId)
+      }
 
       if (events.length) {
         for await (const result of group.ingest(sortEventsChronological(events))) {
-          if (result?.kind !== 'applicationMessage') continue
-          const rumor = deserializeApplicationRumor(result.message)
+          const rumor = readApplicationRumorFromIngestResult(result)
           if (!rumor || !this.isMetadataRumor(rumor)) continue
 
           const parsedMetadata = this.extractMetadataFromRumor(rumor)
@@ -1877,13 +1939,25 @@ export class MarmotService {
     this.groupsById.set(group.idStr, group)
 
     const relays = uniqueRelays(group.relays || this.relays)
+    const groupEventId = resolveNostrGroupEventId(group)
     const lastSync = this.lastSyncAtByConversation.get(group.idStr) || 0
 
-    const events = await this.network.request(relays, {
+    const since = lastSync > 0 ? Math.max(0, lastSync - 20) : undefined
+
+    let events = await this.network.request(relays, {
       kinds: [GROUP_EVENT_KIND],
-      '#h': [group.idStr],
-      ...(lastSync > 0 ? { since: Math.max(0, lastSync - 20) } : {})
+      '#h': groupEventId ? [groupEventId] : [group.idStr],
+      ...(since ? { since } : {})
     })
+
+    if (!events.length && groupEventId && since) {
+      const fallbackEvents = await this.network.request(relays, {
+        kinds: [GROUP_EVENT_KIND],
+        since,
+        limit: 400
+      })
+      events = filterEventsByGroupEventId(fallbackEvents, groupEventId)
+    }
 
     if (!events.length) {
       return { changed: false, newMessages: [] }
@@ -1899,9 +1973,8 @@ export class MarmotService {
     let metadataChanged = false
 
     for await (const result of group.ingest(sortEventsChronological(events))) {
-      if (result?.kind !== 'applicationMessage') continue
-      const rumor = deserializeApplicationRumor(result.message)
-      if (!rumor || !rumor.id) continue
+      const rumor = readApplicationRumorFromIngestResult(result)
+      if (!rumor) continue
 
       if (this.isMetadataRumor(rumor)) {
         const changed = this.applyMetadataRumor(group.idStr, rumor)
@@ -2354,6 +2427,7 @@ export class MarmotService {
     })
 
     this.groupsById.set(group.idStr, group)
+    this.lastSyncAtByConversation.set(group.idStr, nowSeconds())
     this.schedulePersist()
 
     if (normalizedImageUrl) {
@@ -2516,6 +2590,14 @@ export class MarmotService {
 
       this.groupsById.set(group.idStr, group)
       conversationId = group.idStr
+      this.lastSyncAtByConversation.set(
+        group.idStr,
+        Math.max(
+          Number(invite.createdAt) || 0,
+          Number(normalizedWelcomeRumor?.created_at) || 0,
+          nowSeconds()
+        )
+      )
       this.schedulePersist()
 
       const shellConversation = this.buildConversationSummary(group)

@@ -235,6 +235,7 @@ const GROUP_PRESENCE_GATEWAY_TIMEOUT_MS = resolveTimeoutEnvMs('GROUP_PRESENCE_GA
 const GROUP_PRESENCE_DISCOVERY_TIMEOUT_MS = resolveTimeoutEnvMs('GROUP_PRESENCE_DISCOVERY_TIMEOUT_MS', 4000, {
   minMs: 250
 })
+const BLIND_PEER_IDENTITY_REFRESH_DEBOUNCE_MS = 10000
 const GROUP_PRESENCE_PROBE_TIMEOUT_MS = resolveTimeoutEnvMs(
   'GROUP_PRESENCE_PROBE_TIMEOUT_MS',
   JOIN_PROBE_TIMEOUT_MS,
@@ -3637,6 +3638,7 @@ async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
   try {
     const { relays: precomputedRelays } = options
     const manager = await ensureBlindPeeringManager().catch(() => null)
+    const blindPeeringEnabled = manager?.enabled === true || publicGatewaySettings?.blindPeerEnabled === true
     const blindPeeringPublicKey = typeof manager?.getLocalBlindPeerPublicKey === 'function'
       ? manager.getLocalBlindPeerPublicKey()
       : null
@@ -3653,7 +3655,7 @@ async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
       address: config.proxy_server_address || `${gatewayOptions.hostname || '127.0.0.1'}:${gatewayOptions.port || 8443}`,
       relays: entries
     }, { source: reason, skipConnect: true })
-    pendingGatewayMetadataSync = false
+    pendingGatewayMetadataSync = blindPeeringEnabled && !blindPeeringPublicKey
     console.log('[Worker] Synced gateway peer metadata', {
       reason,
       owner: config.nostr_pubkey_hex.slice(0, 8),
@@ -3662,9 +3664,196 @@ async function syncGatewayPeerMetadata(reason = 'unspecified', options = {}) {
       aliasEntries: Math.max(entries.length - relayCount, 0),
       blindPeeringPublicKey: previewValue(blindPeeringPublicKey, 16)
     })
+    if (pendingGatewayMetadataSync) {
+      console.warn('[Worker] Gateway peer metadata synced without blind peering identity; scheduling retry', {
+        reason,
+        blindPeeringEnabled
+      })
+      scheduleRelayServerBlindPeerRegistration(reason, 1500)
+      scheduleGatewayRelayRegistryRefreshWithOptions('blind-peer-identity-pending', 1500, {
+        requireBlindPeerKey: true,
+        blindPeerTimeoutMs: 5000,
+        blindPeerPollMs: 100
+      })
+    }
   } catch (error) {
     pendingGatewayMetadataSync = true
     console.warn('[Worker] Failed to sync gateway peer metadata:', error?.message || error)
+  }
+}
+
+function scheduleGatewayRelayRegistryRefresh(reason = 'gateway-refresh', delayMs = 1000) {
+  return scheduleGatewayRelayRegistryRefreshWithOptions(reason, delayMs)
+}
+
+async function refreshBlindPeerGatewayIdentity(reason = 'blind-peer-key-available', options = {}) {
+  const manager = await ensureBlindPeeringManager().catch(() => null)
+  const blindPeeringPublicKey = typeof options?.blindPeeringPublicKey === 'string' && options.blindPeeringPublicKey.trim()
+    ? options.blindPeeringPublicKey.trim()
+    : (typeof manager?.getLocalBlindPeerPublicKey === 'function' ? manager.getLocalBlindPeerPublicKey() : null)
+  if (!blindPeeringPublicKey) {
+    return { ok: false, reason: 'missing-local-identity' }
+  }
+  const now = Date.now()
+  const recentlyApplied =
+    !options?.force
+    && blindPeeringPublicKey === lastBlindPeerGatewayIdentityRefreshKey
+    && (now - lastBlindPeerGatewayIdentityRefreshAt) < BLIND_PEER_IDENTITY_REFRESH_DEBOUNCE_MS
+  if (recentlyApplied) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: 'recently-applied',
+      blindPeeringPublicKey
+    }
+  }
+  if (typeof relayServer?.applyRuntimeBlindPeeringIdentity === 'function') {
+    relayServer.applyRuntimeBlindPeeringIdentity({ blindPeeringPublicKey })
+  }
+  pendingGatewayMetadataSync = true
+  await syncGatewayPeerMetadata(`${reason}-peer-metadata`).catch((error) => {
+    console.warn('[Worker] Blind peer gateway metadata refresh failed:', error?.message || error)
+  })
+  let relayRegistrationResult = null
+  if (relayServer?.registerWithGateway) {
+    relayRegistrationResult = await relayServer.registerWithGateway(null, {
+      skipQueue: true,
+      reason: `${reason}-relay-server-refresh`
+    }).catch((error) => {
+      console.warn('[Worker] Blind peer relay registration refresh failed:', error?.message || error)
+      return { acknowledged: false, error: error?.message || String(error) }
+    })
+  }
+  lastBlindPeerGatewayIdentityRefreshKey = blindPeeringPublicKey
+  lastBlindPeerGatewayIdentityRefreshAt = Date.now()
+  return {
+    ok: true,
+    blindPeeringPublicKey,
+    relayRegistrationResult
+  }
+}
+
+function scheduleRelayServerBlindPeerRegistration(reason = 'blind-peer-key-pending', delayMs = 1500) {
+  if (relayServerBlindPeerRegistrationTimer) return
+  const intervalMs = Number.isFinite(delayMs) ? Math.max(250, Math.trunc(delayMs)) : 1500
+  const scheduleNext = () => {
+    relayServerBlindPeerRegistrationTimer = setTimeout(tick, intervalMs)
+    if (typeof relayServerBlindPeerRegistrationTimer?.unref === 'function') {
+      relayServerBlindPeerRegistrationTimer.unref()
+    }
+  }
+  const tick = async () => {
+    if (!relayServer?.registerWithGateway) {
+      console.log('[Worker] Relay server blind peering registration refresh waiting for relay server module', {
+        reason
+      })
+      scheduleNext()
+      return
+    }
+    const manager = await ensureBlindPeeringManager().catch(() => null)
+    const blindPeeringPublicKey = typeof manager?.getLocalBlindPeerPublicKey === 'function'
+      ? manager.getLocalBlindPeerPublicKey()
+      : null
+    if (!blindPeeringPublicKey) {
+      console.log('[Worker] Relay server blind peering registration refresh waiting for local identity', {
+        reason
+      })
+      scheduleNext()
+      return
+    }
+    try {
+      console.log('[Worker] Relay server blind peering identity available; refreshing gateway registration', {
+        reason,
+        blindPeeringPublicKey: previewValue(blindPeeringPublicKey, 16)
+      })
+      const result = await refreshBlindPeerGatewayIdentity(reason, {
+        blindPeeringPublicKey,
+        force: true
+      })
+      console.log('[Worker] Relay server blind peering registration refresh result', {
+        reason,
+        acknowledged: result?.relayRegistrationResult?.acknowledged === true,
+        queued: result?.relayRegistrationResult?.queued === true,
+        skipped: result?.skipped === true,
+        skippedReason: result?.reason || null
+      })
+      if (result?.queued === true || result?.skipped === true || result?.ok !== true) {
+        scheduleNext()
+        return
+      }
+      relayServerBlindPeerRegistrationTimer = null
+    } catch (error) {
+      console.warn('[Worker] Relay server blind peering registration refresh failed:', error?.message || error)
+      scheduleNext()
+    }
+  }
+  scheduleNext()
+}
+
+async function waitForLocalBlindPeerPublicKey(options = {}) {
+  const timeoutMs = Number.isFinite(options?.timeoutMs) ? Math.max(0, Math.trunc(options.timeoutMs)) : 5000
+  const intervalMs = Number.isFinite(options?.intervalMs) ? Math.max(25, Math.trunc(options.intervalMs)) : 100
+  const manager = await ensureBlindPeeringManager().catch(() => null)
+  if (!manager?.enabled) return null
+
+  const getKey = () => (
+    typeof manager.getLocalBlindPeerPublicKey === 'function'
+      ? manager.getLocalBlindPeerPublicKey()
+      : null
+  )
+
+  const immediate = getKey()
+  if (immediate) return immediate
+
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, intervalMs))
+    const next = getKey()
+    if (next) return next
+  }
+
+  return getKey()
+}
+
+function scheduleGatewayRelayRegistryRefreshWithOptions(reason = 'gateway-refresh', delayMs = 1000, options = {}) {
+  const useBlindPeerTimer = options?.requireBlindPeerKey === true
+  if (useBlindPeerTimer ? blindPeerGatewayRegistryRefreshTimer : gatewayRegistryRefreshTimer) return
+  const timeoutMs = Number.isFinite(delayMs) ? Math.max(0, Math.trunc(delayMs)) : 1000
+  const retryDelayMs = Number.isFinite(options?.retryDelayMs)
+    ? Math.max(250, Math.trunc(options.retryDelayMs))
+    : 1500
+  const timer = setTimeout(async () => {
+    if (useBlindPeerTimer) {
+      blindPeerGatewayRegistryRefreshTimer = null
+    } else {
+      gatewayRegistryRefreshTimer = null
+    }
+    if (options?.requireBlindPeerKey) {
+      const blindPeerKey = await waitForLocalBlindPeerPublicKey({
+        timeoutMs: options?.blindPeerTimeoutMs,
+        intervalMs: options?.blindPeerPollMs
+      })
+      if (!blindPeerKey) {
+        pendingGatewayMetadataSync = true
+        console.warn('[Worker] Blind peering identity still unavailable before scheduled gateway registry refresh', {
+          reason,
+          timeoutMs: options?.blindPeerTimeoutMs ?? 5000
+        })
+        scheduleGatewayRelayRegistryRefreshWithOptions(reason, retryDelayMs, options)
+        return
+      }
+    }
+    refreshGatewayRelayRegistry(reason).catch((err) => {
+      console.warn('[Worker] Scheduled gateway registry refresh failed:', err?.message || err)
+    })
+  }, timeoutMs)
+  if (useBlindPeerTimer) {
+    blindPeerGatewayRegistryRefreshTimer = timer
+  } else {
+    gatewayRegistryRefreshTimer = timer
+  }
+  if (typeof timer?.unref === 'function') {
+    timer.unref()
   }
 }
 
@@ -3721,7 +3910,8 @@ async function refreshGatewayRelayRegistry(reason = 'gateway-refresh', options =
 async function fetchOpenJoinChallenge(relayIdentifier, {
   origin,
   purpose = null,
-  traceContext = null
+  traceContext = null,
+  timeoutMs = OPEN_JOIN_APPEND_CORES_TIMEOUT_MS
 } = {}) {
   if (!relayIdentifier) {
     return { status: 'skipped', reason: 'missing-relay-identifier' }
@@ -3735,107 +3925,132 @@ async function fetchOpenJoinChallenge(relayIdentifier, {
   }
   const base = origin.replace(/\/$/, '')
   const encodedRelay = encodeURIComponent(relayIdentifier)
-  const query = purpose ? `?purpose=${encodeURIComponent(purpose)}` : ''
-  const url = `${base}/api/relays/${encodedRelay}/access/challenge${query}`
-  const { trace, headers: traceHeaders } = buildJoinTraceHeaders(traceContext, {
-    relayIdentifier,
-    route: 'access/challenge',
-    purpose
-  })
-  emitJoinGatewayTrace('open-join-challenge-dispatch', trace, {
-    relayIdentifier,
-    gatewayOrigin: base,
-    purpose: purpose || null
-  })
-  const controller = typeof AbortController === 'function' ? new AbortController() : null
-  const timer = controller
-    ? setTimeout(() => controller.abort(), OPEN_JOIN_APPEND_CORES_TIMEOUT_MS)
-    : null
-  try {
-    const response = await fetchImpl(url, {
-      signal: controller?.signal,
-      headers: traceHeaders
+  const challengeRoutes = purpose === OPEN_JOIN_APPEND_CORES_PURPOSE
+    ? ['open-join/challenge']
+    : purpose === RELAY_OPEN_JOIN_PURPOSE
+      ? ['access/challenge', 'open-join/challenge']
+      : ['access/challenge']
+  let lastError = null
+
+  for (const challengeRoute of challengeRoutes) {
+    const query = challengeRoute === 'open-join/challenge' && purpose === RELAY_OPEN_JOIN_PURPOSE
+      ? ''
+      : (purpose ? `?purpose=${encodeURIComponent(purpose)}` : '')
+    const url = `${base}/api/relays/${encodedRelay}/${challengeRoute}${query}`
+    const { trace, headers: traceHeaders } = buildJoinTraceHeaders(traceContext, {
+      relayIdentifier,
+      route: challengeRoute,
+      purpose
     })
-    const responseTrace = readGatewayTraceHeaders(response)
-    if (!response.ok) {
-      let body = null
-      try {
-        body = await response.text()
-      } catch (_) {}
-      const { errorCode } = parseGatewayErrorPayload(body)
+    emitJoinGatewayTrace('open-join-challenge-dispatch', trace, {
+      relayIdentifier,
+      gatewayOrigin: base,
+      purpose: purpose || null
+    })
+    const controller = typeof AbortController === 'function' ? new AbortController() : null
+    const timer = controller
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : null
+    try {
+      const response = await fetchImpl(url, {
+        signal: controller?.signal,
+        headers: traceHeaders
+      })
+      const responseTrace = readGatewayTraceHeaders(response)
+      if (!response.ok) {
+        let body = null
+        try {
+          body = await response.text()
+        } catch (_) {}
+        const { errorCode } = parseGatewayErrorPayload(body)
+        const shouldFallbackToOpenJoinRoute =
+          challengeRoute === 'access/challenge'
+          && challengeRoutes.includes('open-join/challenge')
+          && response.status === 404
+          && !errorCode
+        emitJoinGatewayTrace('open-join-challenge-response', trace, {
+          relayIdentifier,
+          gatewayOrigin: base,
+          status: 'error',
+          statusCode: response.status,
+          errorCode: errorCode || null,
+          gatewayTraceId: responseTrace.traceId || null,
+          gatewayRequestId: responseTrace.gatewayRequestId || null,
+          responseBodyPreview: body ? body.slice(0, 200) : null
+        }, 'warn')
+        if (shouldFallbackToOpenJoinRoute) {
+          console.warn('[Worker] Gateway access challenge route unavailable; retrying open-join challenge route', {
+            relayIdentifier,
+            origin: base,
+            status: response.status
+          })
+          continue
+        }
+        return {
+          status: 'error',
+          reason: `challenge status ${response.status}`,
+          errorCode: errorCode || null,
+          origin: base,
+          body: body ? body.slice(0, 200) : null,
+          traceId: trace.traceId,
+          gatewayTraceId: responseTrace.traceId || null,
+          gatewayRequestId: responseTrace.gatewayRequestId || null
+        }
+      }
+      const data = await response.json().catch(() => null)
+      if (!data || typeof data !== 'object') {
+        emitJoinGatewayTrace('open-join-challenge-response', trace, {
+          relayIdentifier,
+          gatewayOrigin: base,
+          status: 'error',
+          reason: 'challenge-invalid-payload',
+          gatewayTraceId: responseTrace.traceId || null,
+          gatewayRequestId: responseTrace.gatewayRequestId || null
+        }, 'warn')
+        return { status: 'error', reason: 'challenge invalid payload', origin: base }
+      }
+      if (!data?.challenge) {
+        emitJoinGatewayTrace('open-join-challenge-response', trace, {
+          relayIdentifier,
+          gatewayOrigin: base,
+          status: 'error',
+          reason: 'challenge-missing',
+          gatewayTraceId: responseTrace.traceId || null,
+          gatewayRequestId: responseTrace.gatewayRequestId || null
+        }, 'warn')
+        return { status: 'error', reason: 'challenge missing', origin: base }
+      }
       emitJoinGatewayTrace('open-join-challenge-response', trace, {
         relayIdentifier,
         gatewayOrigin: base,
-        status: 'error',
-        statusCode: response.status,
-        errorCode: errorCode || null,
+        status: 'ok',
+        challengePrefix: previewValue(data?.challenge, 12),
+        expiresAt: data?.expiresAt || null,
         gatewayTraceId: responseTrace.traceId || null,
-        gatewayRequestId: responseTrace.gatewayRequestId || null,
-        responseBodyPreview: body ? body.slice(0, 200) : null
-      }, 'warn')
+        gatewayRequestId: responseTrace.gatewayRequestId || null
+      })
       return {
-        status: 'error',
-        reason: `challenge status ${response.status}`,
-        errorCode: errorCode || null,
+        status: 'ok',
         origin: base,
-        body: body ? body.slice(0, 200) : null,
+        data,
         traceId: trace.traceId,
         gatewayTraceId: responseTrace.traceId || null,
         gatewayRequestId: responseTrace.gatewayRequestId || null
       }
-    }
-    const data = await response.json().catch(() => null)
-    if (!data || typeof data !== 'object') {
+    } catch (error) {
+      lastError = error
       emitJoinGatewayTrace('open-join-challenge-response', trace, {
         relayIdentifier,
         gatewayOrigin: base,
         status: 'error',
-        reason: 'challenge-invalid-payload',
-        gatewayTraceId: responseTrace.traceId || null,
-        gatewayRequestId: responseTrace.gatewayRequestId || null
+        reason: 'challenge-exception',
+        error: error?.message || String(error)
       }, 'warn')
-      return { status: 'error', reason: 'challenge invalid payload', origin: base }
+    } finally {
+      if (timer) clearTimeout(timer)
     }
-    if (!data?.challenge) {
-      emitJoinGatewayTrace('open-join-challenge-response', trace, {
-        relayIdentifier,
-        gatewayOrigin: base,
-        status: 'error',
-        reason: 'challenge-missing',
-        gatewayTraceId: responseTrace.traceId || null,
-        gatewayRequestId: responseTrace.gatewayRequestId || null
-      }, 'warn')
-      return { status: 'error', reason: 'challenge missing', origin: base }
-    }
-    emitJoinGatewayTrace('open-join-challenge-response', trace, {
-      relayIdentifier,
-      gatewayOrigin: base,
-      status: 'ok',
-      challengePrefix: previewValue(data?.challenge, 12),
-      expiresAt: data?.expiresAt || null,
-      gatewayTraceId: responseTrace.traceId || null,
-      gatewayRequestId: responseTrace.gatewayRequestId || null
-    })
-    return {
-      status: 'ok',
-      origin: base,
-      data,
-      traceId: trace.traceId,
-      gatewayTraceId: responseTrace.traceId || null,
-      gatewayRequestId: responseTrace.gatewayRequestId || null
-    }
-  } catch (error) {
-    emitJoinGatewayTrace('open-join-challenge-response', trace, {
-      relayIdentifier,
-      gatewayOrigin: base,
-      status: 'error',
-      reason: 'challenge-exception',
-      error: error?.message || String(error)
-    }, 'warn')
-    return { status: 'error', reason: error?.message || 'challenge failed', origin: base }
-  } finally {
-    if (timer) clearTimeout(timer)
   }
+  return { status: 'error', reason: lastError?.message || 'challenge failed', origin: base }
 }
 
 async function submitOpenJoinAppendCores(relayIdentifier, {
@@ -4250,7 +4465,9 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
   const routing = await resolveRelayGatewayRouting({
     relayIdentifier,
     origins,
-    allowFallback: false
+    // First-time open joins won't have a relay-scoped route yet, so fall back to
+    // the active public gateway selection when no mapping is stored.
+    allowFallback: true
   })
   if (routing.directJoinOnly) {
     emitJoinGatewayStage('open-join', 'routing', {
@@ -4337,6 +4554,8 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
   for (const origin of originList) {
     if (!origin) continue
     const base = origin.replace(/\/$/, '')
+    let controller = null
+    let timer = null
     emitJoinGatewayStage('open-join', 'challenge-request', {
       status: 'attempt',
       relayIdentifier,
@@ -4349,109 +4568,40 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
       gatewayOrigin: base,
       reason
     })
-    const { headers: challengeTraceHeaders } = buildJoinTraceHeaders(trace, {
-      relayIdentifier,
-      route: 'access/challenge',
-      purpose: RELAY_OPEN_JOIN_PURPOSE
-    })
-    const controller = typeof AbortController === 'function' ? new AbortController() : null
-    const timer = controller
-      ? setTimeout(() => controller.abort(), OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS)
-      : null
     try {
-      const challengeUrl = `${base}/api/relays/${encodedRelay}/access/challenge?purpose=${encodeURIComponent(RELAY_OPEN_JOIN_PURPOSE)}`
-      const challengeResponse = await fetchImpl(challengeUrl, {
-        signal: controller?.signal,
-        headers: challengeTraceHeaders
+      const challengeResult = await fetchOpenJoinChallenge(relayIdentifier, {
+        origin: base,
+        purpose: RELAY_OPEN_JOIN_PURPOSE,
+        traceContext: trace,
+        timeoutMs: OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS
       })
-      const challengeResponseTrace = readGatewayTraceHeaders(challengeResponse)
-      if (!challengeResponse.ok) {
-        let body = null
-        try {
-          body = await challengeResponse.text()
-        } catch (_) {}
-        const errorCode = parseGatewayErrorCode(body)
-        lastStatusCode = challengeResponse.status
-        lastErrorCode = errorCode || lastErrorCode
+      if (!challengeResult || challengeResult.status !== 'ok') {
+        const parsedStatusCode = typeof challengeResult?.reason === 'string' && challengeResult.reason.startsWith('challenge status ')
+          ? Number.parseInt(challengeResult.reason.slice('challenge status '.length), 10)
+          : null
+        lastStatusCode = Number.isFinite(parsedStatusCode) ? parsedStatusCode : lastStatusCode
+        lastErrorCode = challengeResult?.errorCode || lastErrorCode
         emitJoinGatewayStage('open-join', 'challenge-response', {
           status: 'error',
           relayIdentifier,
           gatewayOrigin: base,
           reason: 'challenge-failed',
-          statusCode: challengeResponse.status,
-          errorCode: errorCode || null,
+          statusCode: Number.isFinite(lastStatusCode) ? lastStatusCode : null,
+          errorCode: challengeResult?.errorCode || null,
           traceContext: trace
         })
-        emitJoinGatewayTrace('open-join-challenge-response', trace, {
-          relayIdentifier,
-          gatewayOrigin: base,
-          status: 'error',
-          reason: 'challenge-failed',
-          statusCode: challengeResponse.status,
-          errorCode: errorCode || null,
-          responseBodyPreview: body ? body.slice(0, 200) : null,
-          gatewayTraceId: challengeResponseTrace.traceId || null,
-          gatewayRequestId: challengeResponseTrace.gatewayRequestId || null
-        }, 'warn')
         console.warn('[Worker] Open join challenge failed', {
           relayIdentifier,
           origin: base,
-          status: challengeResponse.status,
-          body: body ? body.slice(0, 200) : null,
-          errorCode
+          status: Number.isFinite(lastStatusCode) ? lastStatusCode : null,
+          body: challengeResult?.body || null,
+          errorCode: challengeResult?.errorCode || null
         })
-        lastError = new Error(`challenge status ${challengeResponse.status}`)
+        lastError = new Error(challengeResult?.reason || 'challenge failed')
         continue
       }
-      const challengeData = await challengeResponse.json().catch(() => null)
-      if (!challengeData || typeof challengeData !== 'object') {
-        emitJoinGatewayStage('open-join', 'challenge-response', {
-          status: 'error',
-          relayIdentifier,
-          gatewayOrigin: base,
-          reason: 'challenge-invalid-payload',
-          traceContext: trace
-        })
-        emitJoinGatewayTrace('open-join-challenge-response', trace, {
-          relayIdentifier,
-          gatewayOrigin: base,
-          status: 'error',
-          reason: 'challenge-invalid-payload',
-          gatewayTraceId: challengeResponseTrace.traceId || null,
-          gatewayRequestId: challengeResponseTrace.gatewayRequestId || null
-        }, 'warn')
-        console.warn('[Worker] Open join challenge invalid payload', {
-          relayIdentifier,
-          origin: base
-        })
-        lastError = new Error('challenge invalid payload')
-        continue
-      }
+      const challengeData = challengeResult.data
       const challenge = challengeData?.challenge || null
-      if (!challenge) {
-        emitJoinGatewayStage('open-join', 'challenge-response', {
-          status: 'error',
-          relayIdentifier,
-          gatewayOrigin: base,
-          reason: 'challenge-missing',
-          traceContext: trace
-        })
-        emitJoinGatewayTrace('open-join-challenge-response', trace, {
-          relayIdentifier,
-          gatewayOrigin: base,
-          status: 'error',
-          reason: 'challenge-missing',
-          gatewayTraceId: challengeResponseTrace.traceId || null,
-          gatewayRequestId: challengeResponseTrace.gatewayRequestId || null
-        }, 'warn')
-        console.warn('[Worker] Open join challenge missing', {
-          relayIdentifier,
-          origin: base
-        })
-        lastError = new Error('challenge missing')
-        continue
-      }
-
       const publicIdentifier = challengeData?.publicIdentifier || relayIdentifier
       emitJoinGatewayStage('open-join', 'challenge-response', {
         status: 'ok',
@@ -4466,8 +4616,8 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
         status: 'ok',
         publicIdentifier,
         expiresAt: challengeData?.expiresAt || null,
-        gatewayTraceId: challengeResponseTrace.traceId || null,
-        gatewayRequestId: challengeResponseTrace.gatewayRequestId || null
+        gatewayTraceId: challengeResult?.gatewayTraceId || null,
+        gatewayRequestId: challengeResult?.gatewayRequestId || null
       })
       console.log('[Worker] Open join challenge ok', {
         relayIdentifier,
@@ -4546,6 +4696,11 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
         relayIdentifier,
         route: 'open-join/request'
       })
+      controller = typeof AbortController === 'function' ? new AbortController() : null
+      timer = controller
+        ? setTimeout(() => controller.abort(), OPEN_JOIN_BOOTSTRAP_TIMEOUT_MS)
+        : null
+      timer?.unref?.()
       emitJoinGatewayStage('open-join', 'request', {
         status: 'attempt',
         relayIdentifier,
@@ -4558,7 +4713,8 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
           'content-type': 'application/json',
           ...joinTraceHeaders
         },
-        body: JSON.stringify({ authEvent })
+        body: JSON.stringify({ authEvent }),
+        signal: controller?.signal
       })
       const joinResponseTrace = readGatewayTraceHeaders(joinResponse)
       if (!joinResponse.ok) {
@@ -4790,6 +4946,8 @@ async function fetchOpenJoinBootstrap(relayIdentifier, {
       }, 'warn')
     } finally {
       if (timer) clearTimeout(timer)
+      timer = null
+      controller = null
     }
   }
 
@@ -5358,7 +5516,30 @@ async function ensureBlindPeeringManager(runtime = {}) {
   if (!blindPeeringManager) {
     blindPeeringManager = new BlindPeeringManager({
       logger: console,
-      settingsProvider: () => publicGatewaySettings
+      settingsProvider: () => publicGatewaySettings,
+      onLocalIdentityAvailable: (blindPeerKey) => {
+        pendingGatewayMetadataSync = true
+        console.log('[Worker] Blind peering identity became available', {
+          blindPeeringPublicKey: previewValue(blindPeerKey, 16)
+        })
+        refreshBlindPeerGatewayIdentity('blind-peer-key-available-direct', {
+          blindPeeringPublicKey: blindPeerKey,
+          force: true
+        }).then((result) => {
+          console.log('[Worker] Direct blind peer gateway registration refresh result', {
+            acknowledged: result?.relayRegistrationResult?.acknowledged === true,
+            queued: result?.relayRegistrationResult?.queued === true,
+            skipped: result?.skipped === true,
+            skippedReason: result?.reason || null
+          })
+        }).catch((error) => {
+          console.warn('[Worker] Direct blind peer gateway registration refresh failed:', error?.message || error)
+        })
+        scheduleRelayServerBlindPeerRegistration('blind-peer-key-available', 250)
+        refreshGatewayRelayRegistry('blind-peer-key-available').catch((error) => {
+          console.warn('[Worker] Failed to refresh gateway registry after blind peer identity became available:', error?.message || error)
+        })
+      }
     })
   }
 
@@ -5717,6 +5898,12 @@ async function startGatewayService(options = {}) {
             wakeup: null,
             swarmKeyPair: deriveSwarmKeyPair(config)
           })
+          scheduleGatewayRelayRegistryRefreshWithOptions('blind-peer-status-started', 0, {
+            requireBlindPeerKey: true,
+            blindPeerTimeoutMs: 5000,
+            blindPeerPollMs: 100
+          })
+          scheduleRelayServerBlindPeerRegistration('blind-peer-status-started', 1500)
           await seedBlindPeeringMirrors(manager)
           await manager.refreshFromBlindPeers('status-sync')
           await manager.rehydrateMirrors({
@@ -5850,6 +6037,12 @@ async function startGatewayService(options = {}) {
       corestore: getCorestore(),
       wakeup: null
     })
+    scheduleGatewayRelayRegistryRefreshWithOptions('blind-peer-gateway-started', 0, {
+      requireBlindPeerKey: true,
+      blindPeerTimeoutMs: 5000,
+      blindPeerPollMs: 100
+    })
+    scheduleRelayServerBlindPeerRegistration('blind-peer-gateway-started', 1500)
     refreshGatewayRelayRegistry('gateway-started').catch((err) => {
       console.warn('[Worker] Gateway registry refresh failed after start:', err?.message || err)
     })
@@ -5927,6 +6120,9 @@ function getGatewayLogs() {
 
 // Variable to store the relay server module
 let relayServer = null
+let relayServerBlindPeerRegistrationTimer = null
+let lastBlindPeerGatewayIdentityRefreshKey = null
+let lastBlindPeerGatewayIdentityRefreshAt = 0
 let isShuttingDown = false
 const SHUTDOWN_FORCE_EXIT_MS = Math.max(
   1_000,
@@ -5956,6 +6152,8 @@ let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1
 let publicGatewaySettings = null
 let publicGatewayStatusCache = null
 let pendingGatewayMetadataSync = false
+let gatewayRegistryRefreshTimer = null
+let blindPeerGatewayRegistryRefreshTimer = null
 let marmotService = null
 let conversationFileIndex = null
 let mediaServiceManager = null
@@ -9975,7 +10173,6 @@ async function handleMessageObject(message) {
                 if (bootstrapResult) {
                   gatewayBootstrapResult = bootstrapResult
                 }
-
                 const mergedBootstrap = mergeOpenJoinBootstrap(bootstrapResult, {
                   relayIdentifier,
                   reason: selectedDirectCandidate ? 'direct-quick-check' : 'join-flow'
@@ -11592,6 +11789,10 @@ async function cleanup() {
     clearInterval(relayWriterQueueRetryTimer)
     relayWriterQueueRetryTimer = null
   }
+  if (relayServerBlindPeerRegistrationTimer) {
+    clearInterval(relayServerBlindPeerRegistrationTimer)
+    relayServerBlindPeerRegistrationTimer = null
+  }
   for (const relayKey of relayWriterQueueWatchers.keys()) {
     clearRelayWriterQueueWatcher(relayKey)
   }
@@ -11842,6 +12043,12 @@ async function main() {
         corestore: getCorestore(),
         wakeup: null
       })
+      scheduleGatewayRelayRegistryRefreshWithOptions('blind-peer-started', 0, {
+        requireBlindPeerKey: true,
+        blindPeerTimeoutMs: 5000,
+        blindPeerPollMs: 100
+      })
+      scheduleRelayServerBlindPeerRegistration('blind-peer-started', 1500)
       await seedBlindPeeringMirrors(manager)
       await manager.refreshFromBlindPeers('startup')
       await manager.rehydrateMirrors({

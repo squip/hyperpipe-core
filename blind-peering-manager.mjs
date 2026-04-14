@@ -104,10 +104,13 @@ function previewValue(value, length = 16) {
 }
 
 export default class BlindPeeringManager extends EventEmitter {
-  constructor({ logger, settingsProvider } = {}) {
+  constructor({ logger, settingsProvider, onLocalIdentityAvailable } = {}) {
     super();
     this.logger = logger || console;
     this.settingsProvider = typeof settingsProvider === 'function' ? settingsProvider : () => null;
+    this.onLocalIdentityAvailable = typeof onLocalIdentityAvailable === 'function'
+      ? onLocalIdentityAvailable
+      : null;
 
     this.runtime = {
       corestore: null,
@@ -117,6 +120,8 @@ export default class BlindPeeringManager extends EventEmitter {
 
     this.enabled = false;
     this.started = false;
+    this.lastAnnouncedBlindPeerPublicKey = null;
+    this.lastSnapshotNotifiedBlindPeerPublicKey = null;
     this.handshakeMirrors = new Set();
     this.manualMirrors = new Set();
     this.trustedMirrors = new Set();
@@ -155,6 +160,7 @@ export default class BlindPeeringManager extends EventEmitter {
       lastResult: null,
       lastCompletedAt: null
     };
+    this.localIdentityMonitorTimer = null;
     this.blindPeerDiagnosticsInstalled = false;
     this.instrumentedBlindPeerClients = new WeakSet();
     this.instrumentedBlindPeerStreams = new WeakSet();
@@ -234,8 +240,10 @@ export default class BlindPeeringManager extends EventEmitter {
     await this.#loadMetadata();
 
     this.started = true;
+    this.lastAnnouncedBlindPeerPublicKey = null;
+    this.#startLocalIdentityMonitor();
     const blindPeerKeyBuffer = this.swarm?.dht?.defaultKeyPair?.publicKey || null;
-    const blindPeerKey = normalizeCoreKey(blindPeerKeyBuffer);
+    const blindPeerKey = this.getLocalBlindPeerPublicKey();
     const blindPeerKeyHex = blindPeerKeyBuffer ? Buffer.from(blindPeerKeyBuffer).toString('hex') : null;
     const swarmPublicKeyHex = this.runtime?.swarmKeyPair?.publicKey
       ? Buffer.from(this.runtime.swarmKeyPair.publicKey).toString('hex')
@@ -257,6 +265,11 @@ export default class BlindPeeringManager extends EventEmitter {
   async stop() {
     if (!this.started) return;
     this.started = false;
+    this.lastAnnouncedBlindPeerPublicKey = null;
+    if (this.localIdentityMonitorTimer) {
+      clearInterval(this.localIdentityMonitorTimer);
+      this.localIdentityMonitorTimer = null;
+    }
     try {
       await this.blindPeering?.close?.();
     } catch (error) {
@@ -1547,6 +1560,22 @@ export default class BlindPeeringManager extends EventEmitter {
     }).length;
 
     const localBlindPeerPublicKey = this.getLocalBlindPeerPublicKey();
+    if (
+      localBlindPeerPublicKey
+      && localBlindPeerPublicKey !== this.lastSnapshotNotifiedBlindPeerPublicKey
+    ) {
+      this.lastSnapshotNotifiedBlindPeerPublicKey = localBlindPeerPublicKey;
+      if (this.onLocalIdentityAvailable) {
+        try {
+          this.onLocalIdentityAvailable(localBlindPeerPublicKey);
+        } catch (error) {
+          this.logger?.warn?.('[BlindPeering] Failed to notify local identity listener from transport snapshot', {
+            error: error?.message || error
+          });
+        }
+      }
+      this.emit('local-key-available', localBlindPeerPublicKey);
+    }
     const blindPeerClients = this.#collectBlindPeerClientSummary({ limit: normalizedLimit });
 
     return {
@@ -1573,8 +1602,66 @@ export default class BlindPeeringManager extends EventEmitter {
   }
 
   getLocalBlindPeerPublicKey() {
-    const keyBuffer = this.swarm?.dht?.defaultKeyPair?.publicKey || null;
-    return normalizeCoreKey(keyBuffer);
+    const candidates = [
+      {
+        source: 'swarm-default-keypair',
+        value: this.swarm?.dht?.defaultKeyPair?.publicKey || null
+      },
+      {
+        source: 'blind-peering-swarm-default-keypair',
+        value: this.blindPeering?.swarm?.dht?.defaultKeyPair?.publicKey || null
+      }
+    ];
+
+    const refs = this.blindPeering?.blindPeersByKey;
+    if (refs && typeof refs.values === 'function') {
+      for (const ref of refs.values()) {
+        const peer = ref?.peer || null;
+        candidates.push({
+          source: 'blind-peer-stream',
+          value: peer?.stream?.publicKey || peer?.rpc?.stream?.publicKey || null
+        });
+        candidates.push({
+          source: 'blind-peer-key',
+          value: peer?.key || null
+        });
+      }
+    }
+
+    for (const candidate of candidates) {
+      const blindPeerKey = normalizeCoreKey(candidate?.value || null);
+      if (!blindPeerKey) continue;
+      return this.#announceLocalBlindPeerPublicKey(blindPeerKey, candidate?.source || 'unknown');
+    }
+
+    return null;
+  }
+
+  #announceLocalBlindPeerPublicKey(blindPeerKey, source = 'unknown') {
+    if (!blindPeerKey) return null;
+    if (blindPeerKey === this.lastAnnouncedBlindPeerPublicKey) {
+      return blindPeerKey;
+    }
+    this.lastAnnouncedBlindPeerPublicKey = blindPeerKey;
+    if (this.localIdentityMonitorTimer) {
+      clearInterval(this.localIdentityMonitorTimer);
+      this.localIdentityMonitorTimer = null;
+    }
+    this.logger?.info?.('[BlindPeering] Local blind peer identity available', {
+      blindPeerKey: previewValue(blindPeerKey, 16),
+      source
+    });
+    if (this.onLocalIdentityAvailable) {
+      try {
+        this.onLocalIdentityAvailable(blindPeerKey);
+      } catch (error) {
+        this.logger?.warn?.('[BlindPeering] Failed to notify local identity listener', {
+          error: error?.message || error
+        });
+      }
+    }
+    this.emit('local-key-available', blindPeerKey);
+    return blindPeerKey;
   }
 
   logTransportSnapshot(reason = 'manual', details = {}, level = 'info') {
@@ -1727,6 +1814,7 @@ export default class BlindPeeringManager extends EventEmitter {
 
     const remote = previewValue(normalizeCoreKey(stream.remotePublicKey || null), 16);
     const local = previewValue(normalizeCoreKey(stream.publicKey || null), 16);
+    this.#announceLocalBlindPeerPublicKey(normalizeCoreKey(stream.publicKey || null), 'mirror-stream');
 
     this.logger?.debug?.('[BlindPeering] Mirror stream attached', {
       mirror,
@@ -1737,6 +1825,7 @@ export default class BlindPeeringManager extends EventEmitter {
 
     if (stream?.opened && typeof stream.opened.then === 'function') {
       stream.opened.then(() => {
+        this.#announceLocalBlindPeerPublicKey(normalizeCoreKey(stream.publicKey || null), 'mirror-stream-opened');
         this.logger?.debug?.('[BlindPeering] Mirror stream opened', {
           mirror,
           remote: previewValue(normalizeCoreKey(stream.remotePublicKey || null), 16),
@@ -1990,5 +2079,28 @@ export default class BlindPeeringManager extends EventEmitter {
       }
     }
     return this.ownerPeerKey;
+  }
+
+  #startLocalIdentityMonitor() {
+    if (this.localIdentityMonitorTimer || !this.started) return;
+    const poll = () => {
+      try {
+        const key = this.getLocalBlindPeerPublicKey();
+        if (key && this.localIdentityMonitorTimer) {
+          clearInterval(this.localIdentityMonitorTimer);
+          this.localIdentityMonitorTimer = null;
+        }
+      } catch (error) {
+        this.logger?.warn?.('[BlindPeering] Failed to poll local blind peer identity', {
+          error: error?.message || error
+        });
+      }
+    };
+    poll();
+    if (this.lastAnnouncedBlindPeerPublicKey) return;
+    this.localIdentityMonitorTimer = setInterval(poll, 250);
+    if (typeof this.localIdentityMonitorTimer?.unref === 'function') {
+      this.localIdentityMonitorTimer.unref();
+    }
   }
 }

@@ -221,3 +221,141 @@ test('GatewayService registers joined relays with public gateway for presence tr
     service.connectionPool?.destroy?.()
   }
 })
+
+test('GatewayService forwards blind peering key in hosted relay registration payload', async t => {
+  const service = new GatewayService({ publicGateway: { enabled: true } })
+  const registerCalls = []
+
+  service.publicGatewaySettings.enabled = true
+  service.publicGatewaySettings.baseUrl = 'https://gateway.test'
+  service.publicGatewaySettings.sharedSecret = 'test-shared-secret'
+  service.discoveredGateways = [{
+    publicUrl: 'https://gateway.test',
+    authMethod: 'shared-secret-v1',
+    sharedSecret: 'test-shared-secret'
+  }]
+  service.publicGatewayLegacyRegistrars.set('https://gateway.test::test-shared-secret', {
+    isEnabled: () => true,
+    registerRelay: async (...args) => {
+      registerCalls.push(args)
+      return { success: true }
+    },
+    unregisterRelay: async () => ({ success: true }),
+    updateOpenJoinPool: async () => ({ success: true }),
+    issueGatewayToken: async () => ({ success: true }),
+    refreshGatewayToken: async () => ({ success: true }),
+    revokeGatewayToken: async () => ({ success: true })
+  })
+
+  try {
+    const response = await service.registerPeerMetadata({
+      publicKey: 'peer-hosted-relay',
+      blindPeeringPublicKey: 'k44683wpzchhqfhwaq83qhqt59g4ymdz139hdk9hnhonc9h3ozxy',
+      mode: 'hyperswarm',
+      relays: [
+        {
+          identifier: 'npubhosted:group-a',
+          name: 'Hosted Group A',
+          isHosted: true,
+          isJoined: false,
+          directJoinOnly: false,
+          isPublic: true,
+          isOpen: true
+        }
+      ]
+    }, {
+      source: 'test',
+      skipConnect: true
+    })
+
+    t.is(response?.relayCount, 1)
+
+    await service.syncPublicGatewayRelay('npubhosted:group-a')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    t.ok(registerCalls.length >= 1, 'expected hosted relay to register with public gateway')
+    if (registerCalls.length) {
+      const [relayIdentifier, relayPayload] = registerCalls[registerCalls.length - 1]
+      t.is(relayIdentifier, 'npubhosted:group-a')
+      t.is(relayPayload?.metadata?.blindPeeringPublicKey, 'k44683wpzchhqfhwaq83qhqt59g4ymdz139hdk9hnhonc9h3ozxy')
+    }
+  } finally {
+    service.connectionPool?.destroy?.()
+  }
+})
+
+test('GatewayService prefers manual shared-secret settings over discovered bearer auth for the same gateway origin', async t => {
+  const service = new GatewayService({ publicGateway: { enabled: true } })
+  const legacyRegisterCalls = []
+  const controlRegisterCalls = []
+
+  service.publicGatewaySettings.enabled = true
+  service.publicGatewaySettings.selectionMode = 'manual'
+  service.publicGatewaySettings.baseUrl = 'https://gateway.test'
+  service.publicGatewaySettings.sharedSecret = 'manual-shared-secret'
+  service.publicGatewaySettings.authMethod = 'shared-secret-v1'
+  service.publicGatewaySettings.resolvedAuthMethod = 'shared-secret-v1'
+  service.discoveredGateways = [{
+    gatewayId: 'gw-bearer-test',
+    publicUrl: 'https://gateway.test',
+    authMethod: 'relay-scoped-bearer-v1'
+  }]
+  service.publicGatewayLegacyRegistrars.set('https://gateway.test::manual-shared-secret', {
+    isEnabled: () => true,
+    registerRelay: async (...args) => {
+      legacyRegisterCalls.push(args)
+      return { success: true }
+    },
+    unregisterRelay: async () => ({ success: true }),
+    updateOpenJoinPool: async () => ({ success: true }),
+    issueGatewayToken: async () => ({ success: true }),
+    refreshGatewayToken: async () => ({ success: true }),
+    revokeGatewayToken: async () => ({ success: true })
+  })
+  service.publicGatewayControlClients.set('https://gateway.test', {
+    isEnabled: () => true,
+    registerRelay: async (...args) => {
+      controlRegisterCalls.push(args)
+      return { success: true }
+    },
+    unregisterRelay: async () => ({ success: true }),
+    updateOpenJoinPool: async () => ({ success: true }),
+    issueGatewayToken: async () => ({ success: true }),
+    refreshGatewayToken: async () => ({ success: true }),
+    revokeGatewayToken: async () => ({ success: true })
+  })
+
+  try {
+    await service.registerPeerMetadata({
+      publicKey: 'peer-manual-shared-secret',
+      mode: 'hyperswarm',
+      relays: [
+        {
+          identifier: 'npubmanual:group-a',
+          name: 'Manual Shared Secret Group',
+          isHosted: true,
+          isJoined: false,
+          directJoinOnly: false,
+          isPublic: true,
+          isOpen: true,
+          gatewayOrigin: 'https://gateway.test'
+        }
+      ]
+    }, {
+      source: 'test',
+      skipConnect: true
+    })
+
+    await service.syncPublicGatewayRelay('npubmanual:group-a')
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    t.ok(legacyRegisterCalls.length >= 1, 'expected manual shared-secret route to use legacy registrar')
+    t.is(controlRegisterCalls.length, 0, 'expected manual shared-secret route to avoid bearer control client')
+    if (legacyRegisterCalls.length) {
+      const [relayIdentifier] = legacyRegisterCalls[legacyRegisterCalls.length - 1]
+      t.is(relayIdentifier, 'npubmanual:group-a')
+    }
+  } finally {
+    service.connectionPool?.destroy?.()
+  }
+})
