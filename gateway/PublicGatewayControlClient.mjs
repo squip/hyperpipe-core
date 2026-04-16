@@ -26,6 +26,45 @@ async function parseResponsePayload(response) {
   }
 }
 
+function createTraceId(prefix = 'pg-ctl') {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`
+}
+
+function previewValue(value, length = 24) {
+  if (typeof value !== 'string') return value ?? null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  return trimmed.length > length ? trimmed.slice(0, length) : trimmed
+}
+
+function summarizeBody(body) {
+  if (!body || typeof body !== 'object') return null
+  const registration = body.registration && typeof body.registration === 'object'
+    ? body.registration
+    : null
+  const payload = body.payload && typeof body.payload === 'object'
+    ? body.payload
+    : null
+  return {
+    keys: Object.keys(body),
+    relayKey: previewValue(
+      registration?.relayKey
+      || payload?.relayKey
+      || body?.relayKey
+      || null
+    ),
+    relayCount: Array.isArray(registration?.relays) ? registration.relays.length : null,
+    peerCount: Array.isArray(registration?.peers) ? registration.peers.length : null,
+    hasBlindPeeringPublicKey: Boolean(
+      registration?.blindPeeringPublicKey
+      || registration?.blind_peering_public_key
+      || registration?.metadata?.blindPeeringPublicKey
+      || registration?.metadata?.blind_peering_public_key
+    ),
+    entryCount: Array.isArray(payload?.entries) ? payload.entries.length : null
+  }
+}
+
 export default class PublicGatewayControlClient {
   constructor({
     baseUrl = null,
@@ -198,16 +237,28 @@ export default class PublicGatewayControlClient {
     if (!this.baseUrl || !this.fetchImpl) {
       throw new Error('public-gateway-control-disabled')
     }
+    const traceId = createTraceId()
 
     const isAuthEnabled = Boolean(
       this.authClient
       && typeof this.authClient.isEnabled === 'function'
       && this.authClient.isEnabled()
     )
+    this.logger.info('Public gateway control request start', {
+      traceId,
+      baseUrl: this.baseUrl,
+      pathname,
+      method,
+      scope: scope || null,
+      relayKey: relayKey || null,
+      isAuthEnabled,
+      body: summarizeBody(body)
+    })
 
     const sendRequest = async (forceRefresh = false) => {
       const headers = {
-        'content-type': 'application/json'
+        'content-type': 'application/json',
+        'x-hyperpipe-client-trace-id': traceId
       }
       if (isAuthEnabled && typeof this.authClient.issueBearerToken === 'function') {
         const token = await this.authClient.issueBearerToken({
@@ -217,6 +268,14 @@ export default class PublicGatewayControlClient {
         })
         if (typeof token === 'string' && token.trim()) {
           headers.authorization = `Bearer ${token.trim()}`
+          this.logger.info('Public gateway control auth token attached', {
+            traceId,
+            pathname,
+            scope: scope || null,
+            relayKey: relayKey || null,
+            forceRefresh,
+            token: previewValue(token)
+          })
         }
       }
 
@@ -226,6 +285,23 @@ export default class PublicGatewayControlClient {
         body: body == null ? undefined : JSON.stringify(body)
       })
       const payload = await parseResponsePayload(response)
+      this.logger.info('Public gateway control request response', {
+        traceId,
+        baseUrl: this.baseUrl,
+        pathname,
+        method,
+        scope: scope || null,
+        relayKey: relayKey || null,
+        forceRefresh,
+        status: response.status,
+        ok: response.ok,
+        payloadKeys: payload && typeof payload === 'object' ? Object.keys(payload) : [],
+        error: typeof payload?.error === 'string' ? payload.error : null,
+        success: payload?.success === true,
+        statusField: payload?.status || null,
+        hasBlindPeer: !!payload?.blindPeer,
+        hasHyperbee: !!payload?.hyperbee
+      })
       return {
         ok: response.ok,
         status: response.status,
@@ -235,6 +311,12 @@ export default class PublicGatewayControlClient {
 
     let result = await sendRequest(false)
     if (result.status === 401 && isAuthEnabled) {
+      this.logger.warn('Public gateway control request retrying after 401', {
+        traceId,
+        pathname,
+        scope: scope || null,
+        relayKey: relayKey || null
+      })
       if (typeof this.authClient.invalidateToken === 'function') {
         this.authClient.invalidateToken({ scope, relayKey })
       }
@@ -242,9 +324,12 @@ export default class PublicGatewayControlClient {
     }
     if (!result.ok) {
       this.logger.warn('Public gateway control request failed', {
+        traceId,
         pathname,
         status: result.status,
-        relayKey
+        relayKey,
+        scope: scope || null,
+        error: typeof result?.payload?.error === 'string' ? result.payload.error : null
       })
     }
     return result

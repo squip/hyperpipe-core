@@ -6,6 +6,10 @@ import Hyperswarm from 'hyperswarm';
 import BlindPeering from 'blind-peering';
 import HypercoreId from 'hypercore-id-encoding';
 
+const DEFAULT_BLIND_PEERING_GC_WAIT_MS = 10000;
+const DEFAULT_SYSTEM_CORE_PUBLISH_RETRY_DELAY_MS = 1500;
+const DEFAULT_SYSTEM_CORE_PUBLISH_MAX_ATTEMPTS = 5;
+
 function sanitizeKey(value) {
   if (!value || typeof value !== 'string') return null;
   const trimmed = value.trim();
@@ -77,6 +81,21 @@ function decodeCoreKey(value) {
   return null;
 }
 
+function decodeMirrorKeys(values = []) {
+  if (!Array.isArray(values)) return [];
+  const decoded = [];
+  const seen = new Set();
+  for (const value of values) {
+    const normalized = sanitizeKey(value);
+    if (!normalized || seen.has(normalized)) continue;
+    const key = decodeCoreKey(normalized);
+    if (!key) continue;
+    decoded.push(key);
+    seen.add(normalized);
+  }
+  return decoded;
+}
+
 let corestoreCounter = 0;
 
 function ensureCorestoreId(store) {
@@ -123,6 +142,7 @@ export default class BlindPeeringManager extends EventEmitter {
     this.lastAnnouncedBlindPeerPublicKey = null;
     this.handshakeMirrors = new Set();
     this.manualMirrors = new Set();
+    this.runtimeMirrors = new Set();
     this.trustedMirrors = new Set();
     this.mirrorTargets = new Map();
     this.blindPeering = null;
@@ -159,6 +179,11 @@ export default class BlindPeeringManager extends EventEmitter {
       lastResult: null,
       lastCompletedAt: null
     };
+    this.systemCorePublishConfig = {
+      retryDelayMs: DEFAULT_SYSTEM_CORE_PUBLISH_RETRY_DELAY_MS,
+      maxAttempts: DEFAULT_SYSTEM_CORE_PUBLISH_MAX_ATTEMPTS
+    };
+    this.systemCorePublishRetries = new Map();
     this.localIdentityMonitorTimer = null;
     this.blindPeerDiagnosticsInstalled = false;
     this.instrumentedBlindPeerClients = new WeakSet();
@@ -169,7 +194,9 @@ export default class BlindPeeringManager extends EventEmitter {
     const nextSettings = settings || this.settingsProvider();
     if (!nextSettings) {
       this.enabled = false;
-      this.trustedMirrors.clear();
+      this.handshakeMirrors.clear();
+      this.manualMirrors.clear();
+      this.trustedMirrors = new Set(this.runtimeMirrors);
       return;
     }
 
@@ -184,12 +211,13 @@ export default class BlindPeeringManager extends EventEmitter {
     const sanitizedManual = manualKeys.map(sanitizeKey).filter(Boolean);
     this.handshakeMirrors = new Set(sanitizedHandshake);
     this.manualMirrors = new Set(sanitizedManual);
-    this.trustedMirrors = new Set([...this.handshakeMirrors, ...this.manualMirrors]);
+    this.trustedMirrors = new Set([...this.handshakeMirrors, ...this.manualMirrors, ...this.runtimeMirrors]);
 
     this.logger?.debug?.('[BlindPeering] Configuration updated', {
       enabled: this.enabled,
       handshakeKeys: this.handshakeMirrors.size,
       manualKeys: this.manualMirrors.size,
+      runtimeKeys: this.runtimeMirrors.size,
       keys: this.trustedMirrors.size
     });
 
@@ -232,7 +260,8 @@ export default class BlindPeeringManager extends EventEmitter {
 
     this.blindPeering = new BlindPeering(this.swarm, this.runtime.corestore, {
       mirrors: Array.from(this.trustedMirrors),
-      pick: 2
+      pick: 2,
+      gcWait: DEFAULT_BLIND_PEERING_GC_WAIT_MS
     });
     this.#installBlindPeerDiagnostics();
 
@@ -289,6 +318,10 @@ export default class BlindPeeringManager extends EventEmitter {
       clearTimeout(this.metadataSaveTimer);
       this.metadataSaveTimer = null;
     }
+    for (const timer of this.systemCorePublishRetries.values()) {
+      clearTimeout(timer);
+    }
+    this.systemCorePublishRetries.clear();
     for (const key of Array.from(this.coreTransferMonitors.keys())) {
       this.#stopCoreTransferMonitor(key, { reason: 'manager-stop' });
     }
@@ -304,8 +337,8 @@ export default class BlindPeeringManager extends EventEmitter {
     for (const key of peerKeys) {
       const sanitized = sanitizeKey(key);
       if (!sanitized) continue;
-      if (!this.handshakeMirrors.has(sanitized)) {
-        this.handshakeMirrors.add(sanitized);
+      if (!this.runtimeMirrors.has(sanitized)) {
+        this.runtimeMirrors.add(sanitized);
       }
       if (!this.trustedMirrors.has(sanitized)) {
         this.trustedMirrors.add(sanitized);
@@ -377,6 +410,7 @@ export default class BlindPeeringManager extends EventEmitter {
     let autobaseTarget = null;
     if (autobase) {
       autobaseTarget = this.#resolveAutobaseTarget(relayContext);
+      const mirrorKeys = decodeMirrorKeys(relayContext.mirrorKeys);
       if (!autobaseTarget) {
         this.logger?.warn?.('[BlindPeering] Skipping autobase mirroring (no wakeup target)', {
           identifier: relayContext.relayKey || relayContext.publicIdentifier || null
@@ -385,7 +419,8 @@ export default class BlindPeeringManager extends EventEmitter {
         try {
           this.blindPeering.addAutobaseBackground(autobase, autobaseTarget, {
             pick: 2,
-            all: true
+            all: true,
+            mirrors: mirrorKeys.length ? mirrorKeys : undefined
           });
         } catch (error) {
           this.logger?.warn?.('[BlindPeering] Failed to mirror autobase', {
@@ -443,6 +478,9 @@ export default class BlindPeeringManager extends EventEmitter {
       entry.coreRefs = coreRefs;
       entry.context.coreRefs = coreRefs;
     }
+    if (Array.isArray(relayContext.mirrorKeys) && relayContext.mirrorKeys.length) {
+      entry.context.mirrorKeys = Array.from(new Set(relayContext.mirrorKeys.map(sanitizeKey).filter(Boolean)));
+    }
     this.#primeCoreRefsBackground(coreRefs, entry, relayCorestore);
     entry.ownerPeerKey = this.#getOwnerPeerKey();
     entry.announce = true;
@@ -467,7 +505,15 @@ export default class BlindPeeringManager extends EventEmitter {
     this.emit('mirror-requested', entry);
   }
 
-  async primeRelayCoreRefs({ relayKey = null, publicIdentifier = null, coreRefs = [], timeoutMs = 45000, reason = 'manual', corestore = null } = {}) {
+  async primeRelayCoreRefs({
+    relayKey = null,
+    publicIdentifier = null,
+    coreRefs = [],
+    timeoutMs = 45000,
+    reason = 'manual',
+    corestore = null,
+    mirrorKeys = []
+  } = {}) {
     if (!this.started) {
       return { status: 'skipped', reason: 'not-started' };
     }
@@ -488,6 +534,7 @@ export default class BlindPeeringManager extends EventEmitter {
     }
 
     const labelBase = relayKey || publicIdentifier || 'unknown-relay';
+    const scopedMirrors = decodeMirrorKeys(mirrorKeys);
     const summary = {
       status: 'ok',
       reason,
@@ -525,7 +572,8 @@ export default class BlindPeeringManager extends EventEmitter {
         const result = await this.blindPeering.addCore(core, core.key, {
           announce: false,
           priority: 2,
-          pick: 2
+          pick: 2,
+          mirrors: scopedMirrors.length ? scopedMirrors : undefined
         });
         const acknowledgements = Array.isArray(result)
           ? result.filter(Boolean).length
@@ -940,6 +988,7 @@ export default class BlindPeeringManager extends EventEmitter {
       });
     };
 
+    this.#addCoreObject(map, autobase.system?.core || autobase.system, 'autobase-system');
     this.#addCoreObject(map, autobase.core, 'autobase-core');
     this.#addCoreObject(map, autobase.local?.core || autobase.local, 'autobase-local');
     addWriterArray(autobase.activeWriters, 'autobase-writer');
@@ -1050,6 +1099,19 @@ export default class BlindPeeringManager extends EventEmitter {
     const priority = Number.isFinite(entry.priority) ? entry.priority : 2;
     const storeInfo = describeCorestore(targetStore);
     const reason = entry?.context?.reason || null;
+    const systemKey = normalizeCoreKey(
+      entry?.context?.autobase?.system?.core?.key
+        || entry?.context?.autobase?.system?.key
+        || entry?.context?.autobase?.system
+        || null
+    );
+    const referrer = normalizeCoreKey(
+      entry?.context?.autobaseTarget
+        || entry?.context?.autobase?.wakeupCapability?.key
+        || null
+    );
+    const mirrorKeys = decodeMirrorKeys(entry?.context?.mirrorKeys);
+    const target = referrer ? decodeCoreKey(referrer) : null;
     coreRefs
       .map(normalizeCoreKey)
       .filter(Boolean)
@@ -1058,11 +1120,47 @@ export default class BlindPeeringManager extends EventEmitter {
         const core = this.#getMirrorCore(ref, label, targetStore);
         if (!core) return;
         try {
-          this.blindPeering.addCoreBackground(core, core.key, {
+          const options = {
             announce: false,
+            referrer,
             priority,
-            pick: 2
-          });
+            pick: 2,
+            mirrors: mirrorKeys.length ? mirrorKeys : undefined
+          };
+          if (systemKey && ref === systemKey) {
+            this.logger?.info?.('[BlindPeering][SystemCoreDiag] Scheduling relay system core background mirror', {
+              identifier,
+              ref,
+              label,
+              reason,
+              priority,
+              referrer,
+              corestoreId: storeInfo.corestoreId,
+              storagePath: storeInfo.storagePath
+            });
+          }
+          if (systemKey && ref === systemKey && mirrorKeys.length && typeof this.blindPeering?.addCore === 'function') {
+            void this.#publishRelaySystemCore(core, target || core.key, options, {
+              identifier,
+              ref,
+              label,
+              reason,
+              priority,
+              referrer
+            });
+          } else {
+            this.blindPeering.addCoreBackground(core, target || core.key, options);
+            if (systemKey && ref === systemKey) {
+              this.logger?.info?.('[BlindPeering][SystemCoreDiag] Relay system core background mirror scheduled', {
+                identifier,
+                ref,
+                label,
+                reason,
+                priority,
+                referrer
+              });
+            }
+          }
           this.#trackCoreTransfer(core, {
             label,
             ref,
@@ -1081,6 +1179,73 @@ export default class BlindPeeringManager extends EventEmitter {
           });
         }
       });
+  }
+
+  async #publishRelaySystemCore(core, target, options, context = {}) {
+    const retryKey = `${context.identifier || 'relay'}:${context.ref || normalizeCoreKey(core?.key) || 'system'}`;
+    const attempt = Number.isFinite(context.attempt) ? Math.trunc(context.attempt) : 1;
+    if (!this.started || !this.blindPeering || !core) return;
+
+    if (attempt === 1) {
+      const existingTimer = this.systemCorePublishRetries.get(retryKey);
+      if (existingTimer) {
+        clearTimeout(existingTimer);
+        this.systemCorePublishRetries.delete(retryKey);
+      }
+    }
+
+    try {
+      const result = await this.blindPeering.addCore(core, target || core.key, options);
+      const acknowledgements = Array.isArray(result)
+        ? result.filter(Boolean).length
+        : (result ? 1 : 0);
+      this.logger?.info?.('[BlindPeering][SystemCoreDiag] Relay system core explicit mirror publish completed', {
+        ...context,
+        attempt,
+        acknowledgements
+      });
+      if (acknowledgements > 0) {
+        const existingTimer = this.systemCorePublishRetries.get(retryKey);
+        if (existingTimer) {
+          clearTimeout(existingTimer);
+          this.systemCorePublishRetries.delete(retryKey);
+        }
+        return;
+      }
+      this.logger?.warn?.('[BlindPeering][SystemCoreDiag] Relay system core explicit mirror publish yielded no acknowledgement', {
+        ...context,
+        attempt
+      });
+    } catch (error) {
+      this.logger?.warn?.('[BlindPeering][SystemCoreDiag] Relay system core explicit mirror publish failed', {
+        ...context,
+        attempt,
+        error: error?.message || error
+      });
+    }
+
+    if (attempt >= this.systemCorePublishConfig.maxAttempts) {
+      this.systemCorePublishRetries.delete(retryKey);
+      this.logger?.warn?.('[BlindPeering][SystemCoreDiag] Relay system core explicit mirror publish exhausted retries', {
+        ...context,
+        attempt
+      });
+      return;
+    }
+
+    const existingTimer = this.systemCorePublishRetries.get(retryKey);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+    const timer = setTimeout(() => {
+      this.systemCorePublishRetries.delete(retryKey);
+      void this.#publishRelaySystemCore(core, target, options, {
+        ...context,
+        attempt: attempt + 1
+      });
+    }, this.systemCorePublishConfig.retryDelayMs);
+    timer.unref?.();
+    this.systemCorePublishRetries.set(retryKey, timer);
   }
 
   #addCoreObject(target, candidate, label) {
@@ -1516,6 +1681,7 @@ export default class BlindPeeringManager extends EventEmitter {
       running: this.started,
       handshakeMirrors: this.handshakeMirrors.size,
       manualMirrors: this.manualMirrors.size,
+      runtimeMirrors: this.runtimeMirrors.size,
       trustedMirrors: this.trustedMirrors.size,
       targets: this.mirrorTargets.size,
       refreshBackoff: {
@@ -1537,6 +1703,7 @@ export default class BlindPeeringManager extends EventEmitter {
     const trustedMirrors = Array.from(this.trustedMirrors);
     const handshakeMirrors = Array.from(this.handshakeMirrors);
     const manualMirrors = Array.from(this.manualMirrors);
+    const runtimeMirrors = Array.from(this.runtimeMirrors);
     const targetEntries = Array.from(this.mirrorTargets.values());
     const relayTargets = targetEntries.filter((entry) => entry?.type === 'relay').length;
     const driveTargets = targetEntries.filter((entry) => entry?.type !== 'relay').length;
@@ -1571,6 +1738,8 @@ export default class BlindPeeringManager extends EventEmitter {
       handshakeMirrorsPreview: handshakeMirrors.slice(0, normalizedLimit).map((key) => previewValue(key, 16)),
       manualMirrorCount: manualMirrors.length,
       manualMirrorsPreview: manualMirrors.slice(0, normalizedLimit).map((key) => previewValue(key, 16)),
+      runtimeMirrorCount: runtimeMirrors.length,
+      runtimeMirrorsPreview: runtimeMirrors.slice(0, normalizedLimit).map((key) => previewValue(key, 16)),
       mirrorTargetCount: this.mirrorTargets.size,
       relayTargetCount: relayTargets,
       driveTargetCount: driveTargets,

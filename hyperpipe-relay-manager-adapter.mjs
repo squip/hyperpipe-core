@@ -2300,7 +2300,15 @@ async function connectStoredRelayProfile(profile, config, authStore, options = {
                     mirrorStatus: mirrorFetchStatus
                 });
                 if (storedBlindPeer?.publicKey) {
-                    manager.markTrustedMirrors([String(storedBlindPeer.publicKey)]);
+                    if (typeof global.rememberRelayScopedBlindPeer === 'function') {
+                        await global.rememberRelayScopedBlindPeer(storedBlindPeer, {
+                            relayKey,
+                            publicIdentifier,
+                            reason: 'auto-connect'
+                        });
+                    } else {
+                        manager.markTrustedMirrors([String(storedBlindPeer.publicKey)]);
+                    }
                 }
                 manager.ensureRelayMirror({
                     relayKey,

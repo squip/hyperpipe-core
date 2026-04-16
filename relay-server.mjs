@@ -231,6 +231,40 @@ function evaluateGatewayRegistrationRoute(route = null) {
   };
 }
 
+function getPendingRegistrationQueue(gatewayOrigin = null) {
+  const normalizedOrigin = normalizeHttpOrigin(gatewayOrigin);
+  if (!normalizedOrigin) return pendingRegistrations;
+  let queue = pendingRegistrationsByOrigin.get(normalizedOrigin);
+  if (!queue) {
+    queue = [];
+    pendingRegistrationsByOrigin.set(normalizedOrigin, queue);
+  }
+  return queue;
+}
+
+function getPendingRegistrationCount(gatewayOrigin = null) {
+  return getPendingRegistrationQueue(gatewayOrigin).length;
+}
+
+function enqueuePendingRegistration(gatewayOrigin = null, relayProfileInfo = null) {
+  const queue = getPendingRegistrationQueue(gatewayOrigin);
+  queue.push(relayProfileInfo || null);
+  return queue.length;
+}
+
+function getGatewayConnectionForRoute({ gatewayOrigin = null, gatewayId = null } = {}) {
+  const normalizedOrigin = normalizeHttpOrigin(gatewayOrigin);
+  const normalizedGatewayId = normalizeGatewayId(gatewayId);
+  if (normalizedOrigin && gatewayConnectionsByOrigin.has(normalizedOrigin)) {
+    return gatewayConnectionsByOrigin.get(normalizedOrigin) || null;
+  }
+  if (normalizedGatewayId && gatewayConnectionsById.has(normalizedGatewayId)) {
+    return gatewayConnectionsById.get(normalizedGatewayId) || null;
+  }
+  if (normalizedOrigin || normalizedGatewayId) return null;
+  return gatewayConnection || null;
+}
+
 async function resolveRelayGatewayRegistrationEligibility({
   relayKey = null,
   publicIdentifier = null,
@@ -353,8 +387,12 @@ let swarm = null;
 let gatewayRegistrationInterval = null;
 let blindPeerGatewayRegistrationRetryTimer = null;
 let gatewayConnection = null;
+const gatewayConnectionsByOrigin = new Map();
+const gatewayConnectionsById = new Map();
+const gatewayConnectionMetadataByProtocol = new WeakMap();
 let relayServerShuttingDown = false;
 let pendingRegistrations = []; // Queue registrations until gateway connects
+const pendingRegistrationsByOrigin = new Map();
 let connectedPeers = new Map(); // Track all connected peers
 const relayClientConnections = new Map(); // relayKey -> Map(clientId -> { connectionKey, updatedAt })
 
@@ -839,7 +877,7 @@ function scheduleBlindPeerGatewayRegistrationRetry(reason = 'blind-peer-key-pend
       });
       return;
     }
-    if (!gatewayConnection) {
+    if (!gatewayConnection && gatewayConnectionsByOrigin.size === 0 && gatewayConnectionsById.size === 0) {
       console.log('[RelayServer] Blind peering gateway registration retry waiting for gateway connection', {
         reason,
         blindPeeringPublicKey: blindPeeringPublicKey.slice(0, 16)
@@ -1217,6 +1255,14 @@ export async function connectStoredRelays() {
 
     // Try to register immediately if we have pending registrations
     processPendingRegistrations();
+    for (const gatewayOrigin of pendingRegistrationsByOrigin.keys()) {
+      processPendingRegistrations({ gatewayOrigin }).catch((error) => {
+        console.warn('[RelayServer] Failed to process route-scoped pending registrations:', {
+          gatewayOrigin,
+          error: error?.message || error
+        });
+      });
+    }
 
     if (gatewayRegistrationInterval) {
       clearInterval(gatewayRegistrationInterval);
@@ -1225,7 +1271,7 @@ export async function connectStoredRelays() {
 
     gatewayRegistrationInterval = setInterval(() => {
       console.log('[RelayServer] Periodic registration check...');
-      if (gatewayConnection) {
+      if (gatewayConnection || gatewayConnectionsByOrigin.size > 0 || gatewayConnectionsById.size > 0) {
         console.log('[RelayServer] Gateway connected, performing registration');
         registerWithGateway().catch((error) => {
           console.error('[RelayServer] Periodic gateway registration failed:', error.message);
@@ -2207,6 +2253,14 @@ function handlePeerConnection(stream, peerInfo) {
       }
     }
 
+    const gatewayMeta = gatewayConnectionMetadataByProtocol.get(protocol) || null;
+    if (gatewayMeta?.gatewayOrigin && gatewayConnectionsByOrigin.get(gatewayMeta.gatewayOrigin) === protocol) {
+      gatewayConnectionsByOrigin.delete(gatewayMeta.gatewayOrigin);
+    }
+    if (gatewayMeta?.gatewayId && gatewayConnectionsById.get(gatewayMeta.gatewayId) === protocol) {
+      gatewayConnectionsById.delete(gatewayMeta.gatewayId);
+    }
+
     if (gatewayConnection === protocol) {
       console.log('[RelayServer] >>> GATEWAY CONNECTION LOST <<<');
       gatewayConnection = null;
@@ -2226,15 +2280,43 @@ function handlePeerConnection(stream, peerInfo) {
     
     // If this is a registration request from the gateway, identify it
     if (request.path === '/identify-gateway') {
-      if (gatewayConnection && gatewayConnection !== protocol) {
-        console.log('[RelayServer] >>> REPLACING EXISTING GATEWAY CONNECTION <<<');
-        try {
-          gatewayConnection.destroy?.();
-        } catch (_) {}
+      let identifyPayload = null;
+      try {
+        identifyPayload = request?.body?.length
+          ? JSON.parse(Buffer.from(request.body).toString())
+          : null;
+      } catch (error) {
+        console.warn('[RelayServer] Failed to parse gateway identification payload:', error?.message || error);
       }
-
+      const identity = identifyPayload?.payload && typeof identifyPayload.payload === 'object'
+        ? identifyPayload.payload
+        : {};
+      const claimsGateway = identity?.isGateway === true
+        || identity?.gatewayReplica === true
+        || identity?.role === 'gateway'
+        || identity?.role === 'gateway-replica';
+      if (!claimsGateway) {
+        console.warn('[RelayServer] Ignoring gateway identification from non-gateway peer', {
+          peer: publicKey,
+          role: identity?.role || null,
+          isGateway: identity?.isGateway === true,
+          gatewayReplica: identity?.gatewayReplica === true
+        });
+        protocol.sendResponse({
+          id: request.id,
+          statusCode: 409,
+          headers: { 'content-type': 'application/json' },
+          body: b4a.from(JSON.stringify({
+            error: 'not-a-gateway-peer'
+          }))
+        });
+        return;
+      }
       console.log('[RelayServer] >>> GATEWAY IDENTIFICATION REQUEST RECEIVED <<<');
-      setGatewayConnection(protocol, publicKey);
+      setGatewayConnection(protocol, publicKey, {
+        gatewayOrigin: identity?.gatewayOrigin || identity?.publicUrl || null,
+        gatewayId: identity?.gatewayId || null
+      });
 
       protocol.sendResponse({
         id: request.id,
@@ -2276,9 +2358,25 @@ function startKeepAlive(publicKey) {
 }
 
 // Set gateway connection and process pending registrations
-function setGatewayConnection(protocol, publicKey) {
+function setGatewayConnection(protocol, publicKey, {
+  gatewayOrigin = null,
+  gatewayId = null
+} = {}) {
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin);
+  const normalizedGatewayId = normalizeGatewayId(gatewayId);
   gatewayConnection = protocol;
   healthState.services.gatewayStatus = 'connected';
+  gatewayConnectionMetadataByProtocol.set(protocol, {
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizedGatewayId,
+    publicKey
+  });
+  if (normalizedGatewayOrigin) {
+    gatewayConnectionsByOrigin.set(normalizedGatewayOrigin, protocol);
+  }
+  if (normalizedGatewayId) {
+    gatewayConnectionsById.set(normalizedGatewayId, protocol);
+  }
 
   // Mark peer as identified
   const normalizedKey = publicKey.toLowerCase();
@@ -2286,11 +2384,15 @@ function setGatewayConnection(protocol, publicKey) {
   if (peer) {
     peer.identified = true;
     peer.isGateway = true;
+    peer.gatewayOrigin = normalizedGatewayOrigin;
+    peer.gatewayId = normalizedGatewayId;
   }
   
   console.log('[RelayServer] ========================================');
   console.log('[RelayServer] GATEWAY CONNECTION ESTABLISHED');
   console.log('[RelayServer] Gateway public key:', publicKey);
+  console.log('[RelayServer] Gateway origin:', normalizedGatewayOrigin || 'unknown');
+  console.log('[RelayServer] Gateway id:', normalizedGatewayId || 'unknown');
   console.log('[RelayServer] Connection time:', new Date().toISOString());
   console.log('[RelayServer] ========================================');
 
@@ -2305,15 +2407,24 @@ function setGatewayConnection(protocol, publicKey) {
     console.log('[RelayServer] Notifying worker of gateway connection');
     global.sendMessage({
       type: 'gateway-connected',
-      gatewayPublicKey: publicKey
+      gatewayPublicKey: publicKey,
+      gatewayOrigin: normalizedGatewayOrigin,
+      gatewayId: normalizedGatewayId
     });
   }
   
   // Process any pending registrations
-  processPendingRegistrations();
+  processPendingRegistrations({
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizedGatewayId
+  });
 
   // Always re-register active relays on reconnect to rebuild gateway state
-  registerWithGateway(null, { skipQueue: true })
+  registerWithGateway(null, {
+    skipQueue: true,
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizedGatewayId
+  })
     .then(() => {
       console.log('[RelayServer] Refreshed gateway registration after reconnect');
     })
@@ -2323,32 +2434,43 @@ function setGatewayConnection(protocol, publicKey) {
 }
 
 // Process pending registrations
-async function processPendingRegistrations() {
-  if (!gatewayConnection) {
+async function processPendingRegistrations({
+  gatewayOrigin = null,
+  gatewayId = null
+} = {}) {
+  const queue = getPendingRegistrationQueue(gatewayOrigin);
+  const protocol = getGatewayConnectionForRoute({ gatewayOrigin, gatewayId });
+  if (!protocol) {
     console.log('[RelayServer] Cannot process pending registrations - no gateway connection', {
-      pendingCount: pendingRegistrations.length
+      gatewayOrigin: normalizeHttpOrigin(gatewayOrigin),
+      gatewayId: normalizeGatewayId(gatewayId),
+      pendingCount: queue.length
     });
     return;
   }
   
-  if (pendingRegistrations.length === 0) {
+  if (queue.length === 0) {
     console.log('[RelayServer] No pending registrations to process');
     return;
   }
   
   console.log('[RelayServer] ----------------------------------------');
-  console.log(`[RelayServer] Processing ${pendingRegistrations.length} pending registrations`);
+  console.log(`[RelayServer] Processing ${queue.length} pending registrations`);
   
   let processedCount = 0;
-  while (pendingRegistrations.length > 0) {
-    const registration = pendingRegistrations.shift();
+  while (queue.length > 0) {
+    const registration = queue.shift();
     console.log('[RelayServer] Processing pending registration:', registration ? 'with profile' : 'general update');
     try {
-      await registerWithGateway(registration, { skipQueue: true });
+      await registerWithGateway(registration, {
+        skipQueue: true,
+        gatewayOrigin: normalizeHttpOrigin(gatewayOrigin),
+        gatewayId: normalizeGatewayId(gatewayId)
+      });
       processedCount++;
     } catch (error) {
       console.error('[RelayServer] Pending registration failed:', error.message);
-      pendingRegistrations.unshift(registration);
+      queue.unshift(registration);
       console.log('[RelayServer] Will retry pending registrations later');
       return;
     }
@@ -2357,10 +2479,14 @@ async function processPendingRegistrations() {
   if (processedCount > 0) {
     console.log('[RelayServer] Sending fresh registration with current state');
     try {
-      await registerWithGateway(null, { skipQueue: true });
+      await registerWithGateway(null, {
+        skipQueue: true,
+        gatewayOrigin: normalizeHttpOrigin(gatewayOrigin),
+        gatewayId: normalizeGatewayId(gatewayId)
+      });
     } catch (error) {
       console.error('[RelayServer] Failed to send catch-up registration:', error.message);
-      pendingRegistrations.unshift(null);
+      queue.unshift(null);
     }
   }
 
@@ -2763,10 +2889,11 @@ function setupProtocolHandlers(protocol) {
     }
 
     if (!relayActive && !runtime?.profile) {
-      console.warn('[RelayServer] join-capabilities relay-not-found', {
+      console.debug('[RelayServer] join-capabilities unresolved relay', {
         identifier: normalizeRelayIdentifier(rawIdentifier || ''),
         relayKey: runtime?.relayKey || null,
-        publicIdentifier: runtime?.publicIdentifier || null
+        publicIdentifier: runtime?.publicIdentifier || null,
+        expectedDuringBootstrap: true
       });
       updateMetrics(false);
       return {
@@ -3237,7 +3364,7 @@ function setupProtocolHandlers(protocol) {
             }
             
             // Update gateway if connected
-            if (config.registerWithGateway && gatewayConnection) {
+            if (config.registerWithGateway && (gatewayConnection || gatewayConnectionsByOrigin.size > 0 || gatewayConnectionsById.size > 0)) {
                 console.log('[RelayServer] Updating gateway after relay disconnect');
                 try {
                     await registerWithGateway();
@@ -6090,6 +6217,177 @@ function updateMetrics(success = true) {
   }
 }
 
+async function seedRelayScopedGatewayMirror(relayProfileInfo = null, ack = null, {
+  reason = 'gateway-register',
+  gatewayOrigin = null,
+  gatewayId = null
+} = {}) {
+  const relayKey = normalizeRelayKeyHex(relayProfileInfo?.relay_key || null);
+  const publicIdentifier = normalizePublicIdentifierForRoute(relayProfileInfo?.public_identifier || null);
+  const blindPeer = ack && typeof ack === 'object' ? (ack.blindPeer || ack.blind_peer || null) : null;
+  const blindPeerKey = typeof blindPeer?.publicKey === 'string'
+    ? blindPeer.publicKey.trim().toLowerCase()
+    : null;
+
+  if (!relayKey || !blindPeerKey) {
+    return { status: 'skipped', reason: 'missing-relay-or-blind-peer' };
+  }
+
+  try {
+    if (typeof global.rememberRelayScopedBlindPeer === 'function') {
+      await global.rememberRelayScopedBlindPeer(blindPeer, {
+        relayKey,
+        publicIdentifier,
+        gatewayOrigin,
+        gatewayId,
+        reason,
+        activateRuntime: false
+      });
+    } else {
+      const manager = global.blindPeeringManager || null;
+      if (manager?.markTrustedMirrors) {
+        manager.markTrustedMirrors([blindPeerKey]);
+      }
+    }
+  } catch (error) {
+    console.warn('[RelayServer] Failed to remember relay-scoped blind peer', {
+      relayKey,
+      publicIdentifier,
+      blindPeerKey: previewValue(blindPeerKey, 16),
+      reason,
+      error: error?.message || error
+    });
+  }
+
+  const relayManager = activeRelays.get(relayKey);
+  if (!relayManager?.relay) {
+    return { status: 'skipped', reason: 'relay-not-active' };
+  }
+
+  const autobaseEntries = collectRelayCoreRefsFromAutobase(relayManager.relay);
+  const autobaseRefs = normalizeCoreRefList(autobaseEntries);
+  const storedRefs = typeof global.resolveRelayMirrorCoreRefs === 'function'
+    ? await global.resolveRelayMirrorCoreRefs(relayKey, publicIdentifier, autobaseEntries)
+    : await resolveRelayMirrorCoreRefs(relayKey, publicIdentifier, autobaseEntries);
+  const mergedCoreRefs = mergeCoreRefLists(storedRefs, autobaseRefs);
+
+  if (!mergedCoreRefs.length) {
+    return { status: 'skipped', reason: 'missing-core-refs' };
+  }
+
+  if (typeof global.syncActiveRelayCoreRefs === 'function') {
+    await global.syncActiveRelayCoreRefs({
+      relayKey,
+      publicIdentifier,
+      coreRefs: mergedCoreRefs,
+      reason
+    });
+  }
+
+  console.log('[RelayServer] Seeded relay-scoped blind peer mirror after gateway registration', {
+    relayKey,
+    publicIdentifier,
+    reason,
+    blindPeerKey: previewValue(blindPeerKey, 16),
+    coreRefsCount: mergedCoreRefs.length
+  });
+
+  return {
+    status: 'ok',
+    relayKey,
+    publicIdentifier,
+    blindPeerKey,
+    coreRefsCount: mergedCoreRefs.length
+  };
+}
+
+function normalizeGatewayBlindPeerSummary(payload = null) {
+  const summary = payload && typeof payload.summary === 'object' ? payload.summary : null;
+  const status = payload && typeof payload.status === 'object' ? payload.status : null;
+  const config = status && typeof status.config === 'object' ? status.config : null;
+  const publicKey = typeof summary?.publicKey === 'string' && summary.publicKey.trim()
+    ? summary.publicKey.trim()
+    : (typeof status?.publicKey === 'string' && status.publicKey.trim() ? status.publicKey.trim() : null);
+  const encryptionKey = typeof summary?.encryptionKey === 'string' && summary.encryptionKey.trim()
+    ? summary.encryptionKey.trim()
+    : (typeof status?.encryptionKey === 'string' && status.encryptionKey.trim() ? status.encryptionKey.trim() : null);
+  const maxBytes = Number.isFinite(summary?.maxBytes)
+    ? summary.maxBytes
+    : (Number.isFinite(config?.maxBytes) ? config.maxBytes : null);
+
+  if (!publicKey) return null;
+
+  return {
+    enabled: summary?.enabled ?? status?.enabled ?? false,
+    publicKey,
+    encryptionKey,
+    maxBytes
+  };
+}
+
+async function fetchGatewayBlindPeerSummary(gatewayOrigin, {
+  reason = 'gateway-register-fallback'
+} = {}) {
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin);
+  if (!normalizedGatewayOrigin) return null;
+
+  try {
+    const target = new URL('/api/blind-peer', normalizedGatewayOrigin);
+    const response = await fetch(target, {
+      headers: {
+        accept: 'application/json',
+        'cache-control': 'no-store'
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+
+    const payload = await response.json();
+    const blindPeer = normalizeGatewayBlindPeerSummary(payload);
+    if (!blindPeer?.publicKey) {
+      console.warn('[RelayServer] Gateway blind peer fallback response missing public key', {
+        gatewayOrigin: normalizedGatewayOrigin,
+        reason
+      });
+      return null;
+    }
+
+    console.log('[RelayServer] Refreshed gateway blind peer via REST fallback', {
+      gatewayOrigin: normalizedGatewayOrigin,
+      reason,
+      blindPeerKey: previewValue(blindPeer.publicKey, 16)
+    });
+
+    return blindPeer;
+  } catch (error) {
+    console.warn('[RelayServer] Failed to refresh gateway blind peer via REST fallback', {
+      gatewayOrigin: normalizedGatewayOrigin,
+      reason,
+      error: error?.message || error
+    });
+    return null;
+  }
+}
+
+async function resolveGatewayRegistrationBlindPeer({
+  ack = null,
+  gatewayOrigin = null,
+  reason = 'gateway-register'
+} = {}) {
+  const ackBlindPeer = ack && typeof ack === 'object' ? (ack.blindPeer || ack.blind_peer || null) : null;
+  const ackBlindPeerKey = typeof ackBlindPeer?.publicKey === 'string'
+    ? ackBlindPeer.publicKey.trim()
+    : '';
+  if (ackBlindPeerKey) {
+    return ackBlindPeer;
+  }
+
+  return await fetchGatewayBlindPeerSummary(gatewayOrigin, {
+    reason: `${reason}-missing-ack-blind-peer`
+  });
+}
+
 // Register with gateway using Hyperswarm
 export async function registerWithGateway(relayProfileInfo = null, options = {}) {
   const {
@@ -6097,12 +6395,16 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
     requestTimeoutMs = GATEWAY_REGISTRATION_REQUEST_TIMEOUT_MS,
     reason = 'unspecified',
     routeHint = null,
-    routeHints = []
+    routeHints = [],
+    gatewayOrigin = null,
+    gatewayId = null
   } = options || {};
   const normalizedRouteHints = normalizeGatewayRouteHints([
     ...((Array.isArray(routeHints) ? routeHints : [])),
     ...(routeHint ? [routeHint] : [])
   ]);
+  let selectedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin);
+  let selectedGatewayId = normalizeGatewayId(gatewayId);
 
   console.log('[RelayServer] ========================================');
   console.log('[RelayServer] GATEWAY REGISTRATION ATTEMPT (Hyperswarm)');
@@ -6167,6 +6469,7 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
     const metadataCache = new Map();
     const relayList = [];
     let skippedByRouting = 0;
+    const relayGatewayBuckets = new Map();
 
     for (const relay of activeRelays) {
       const profile =
@@ -6189,6 +6492,22 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
       const relayRouteEvaluation = evaluateGatewayRegistrationRoute(relayRoute);
       if (!relayRouteEvaluation.eligible) {
         skippedByRouting += 1;
+        continue;
+      }
+
+      const relayGatewayOrigin = relayRouteEvaluation.gatewayOrigin || null;
+      const relayGatewayId = relayRouteEvaluation.gatewayId || null;
+      const relayGatewayBucket = normalizeHttpOrigin(relayGatewayOrigin) || normalizeGatewayId(relayGatewayId) || null;
+      if (relayGatewayBucket) {
+        relayGatewayBuckets.set(relayGatewayBucket, {
+          gatewayOrigin: relayGatewayOrigin,
+          gatewayId: relayGatewayId
+        });
+      }
+      if (selectedGatewayOrigin && relayGatewayOrigin !== selectedGatewayOrigin) {
+        continue;
+      }
+      if (!selectedGatewayOrigin && selectedGatewayId && relayGatewayId !== selectedGatewayId) {
         continue;
       }
 
@@ -6248,6 +6567,25 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
           }
         } : {})
       });
+    }
+
+    if (!relayProfileInfo && !selectedGatewayOrigin && !selectedGatewayId && relayGatewayBuckets.size > 1) {
+      const results = [];
+      for (const bucket of relayGatewayBuckets.values()) {
+        const result = await registerWithGateway(null, {
+          ...options,
+          skipQueue,
+          requestTimeoutMs,
+          reason,
+          gatewayOrigin: bucket.gatewayOrigin || null,
+          gatewayId: bucket.gatewayId || null
+        });
+        results.push(result);
+      }
+      return {
+        acknowledged: results.every((entry) => entry?.acknowledged === true || entry?.skipped === true),
+        results
+      };
     }
 
     const gatewayServiceInstance = global.gatewayService || null;
@@ -6374,6 +6712,8 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
         publicIdentifier: relayProfileInfo.public_identifier || null
       });
       const newRelayRouteEvaluation = evaluateGatewayRegistrationRoute(newRelayRoute);
+      selectedGatewayOrigin = newRelayRouteEvaluation.gatewayOrigin || selectedGatewayOrigin || null;
+      selectedGatewayId = newRelayRouteEvaluation.gatewayId || selectedGatewayId || null;
 
       if (!newRelayRouteEvaluation.eligible) {
         console.log('[RelayServer] Skipping newRelay registration payload due to routing', {
@@ -6433,29 +6773,37 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
     }
 
     if (relayList.length === 0 && !registrationData.newRelay) {
-      console.log('[RelayServer] Skipping gateway registration payload (no routing-eligible relays)', {
-        reason: 'gateway-unassigned-or-direct-join-only',
+      console.debug('[RelayServer] Skipping gateway registration payload (no routing-eligible relays)', {
+        reason: 'no-routing-eligible-relays',
         activeRelayCount: activeRelays.length,
         skippedByRouting
       });
-      console.log('[RelayServer] ========================================');
       return {
         skipped: true,
-        reason: 'gateway-unassigned-or-direct-join-only',
+        reason: 'no-routing-eligible-relays',
         skippedByRouting
       };
     }
 
-    if (!gatewayConnection) {
+    const routeConnection = getGatewayConnectionForRoute({
+      gatewayOrigin: selectedGatewayOrigin,
+      gatewayId: selectedGatewayId
+    });
+    const pendingCount = getPendingRegistrationCount(selectedGatewayOrigin);
+    if (!routeConnection) {
       console.log('[RelayServer] Gateway connection unavailable - queuing registration for later processing', {
         skipQueue,
-        pendingCount: pendingRegistrations.length,
-        hasGatewayConnection: !!gatewayConnection
+        gatewayOrigin: selectedGatewayOrigin,
+        gatewayId: selectedGatewayId,
+        pendingCount,
+        hasGatewayConnection: !!routeConnection
       });
       if (!skipQueue) {
-        pendingRegistrations.push(relayProfileInfo || null);
+        enqueuePendingRegistration(selectedGatewayOrigin, relayProfileInfo || null);
         console.log('[RelayServer] Pending registrations queued', {
-          pendingCount: pendingRegistrations.length,
+          gatewayOrigin: selectedGatewayOrigin,
+          gatewayId: selectedGatewayId,
+          pendingCount: getPendingRegistrationCount(selectedGatewayOrigin),
           enqueuedWithProfile: !!relayProfileInfo
         });
       }
@@ -6481,7 +6829,7 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
       requestTimeoutMs
     });
 
-    const response = await gatewayConnection.sendRequest({
+    const response = await routeConnection.sendRequest({
       method: 'POST',
       path: '/gateway/register',
       headers: { 'content-type': 'application/json' },
@@ -6503,6 +6851,22 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
       }
     }
 
+    const registrationBlindPeer = await resolveGatewayRegistrationBlindPeer({
+      ack,
+      gatewayOrigin: selectedGatewayOrigin,
+      reason
+    });
+    if (registrationBlindPeer?.publicKey) {
+      ack = ack && typeof ack === 'object'
+        ? {
+            ...ack,
+            blindPeer: registrationBlindPeer
+          }
+        : {
+            blindPeer: registrationBlindPeer
+          };
+    }
+
     console.log('[RelayServer] Gateway registration acknowledged:', ack || { statusCode: response.statusCode });
     console.log('[RelayServer][Checkpoint] create-register-ack', {
       reason,
@@ -6510,6 +6874,14 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
       publicIdentifier: relayProfileInfo?.public_identifier || null,
       statusCode: response.statusCode
     });
+
+    if (relayProfileInfo) {
+      await seedRelayScopedGatewayMirror(relayProfileInfo, ack, {
+        reason: `${reason}-gateway-register`,
+        gatewayOrigin: selectedGatewayOrigin || null,
+        gatewayId: selectedGatewayId || null
+      });
+    }
 
     if (ack && ack.subnetHash) {
       config.subnetHash = ack.subnetHash;
@@ -6556,9 +6928,12 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
             type: 'relay-registration-complete',
             relayKey: relayProfileInfo.relay_key || null,
             publicIdentifier: relayProfileInfo.public_identifier || null,
+            gatewayOrigin: selectedGatewayOrigin || null,
+            gatewayId: selectedGatewayId || null,
             gatewayUrl: connectionUrl,
             authToken: userAuthToken,
-            requiresAuth: relayProfileInfo.auth_config?.requiresAuth || false
+            requiresAuth: relayProfileInfo.auth_config?.requiresAuth || false,
+            blindPeer: ack?.blindPeer || ack?.blind_peer || null
           });
         } catch (notifyError) {
           console.warn('[RelayServer] Failed to emit relay-registration-complete message:', notifyError?.message || notifyError);
@@ -6592,9 +6967,11 @@ export async function registerWithGateway(relayProfileInfo = null, options = {})
     }
     console.error('[RelayServer] Gateway registration via Hyperswarm FAILED:', errorMessage);
     if (!skipQueue) {
-      pendingRegistrations.push(relayProfileInfo || null);
+      enqueuePendingRegistration(selectedGatewayOrigin, relayProfileInfo || null);
       console.log('[RelayServer] Registration re-queued due to failure', {
-        pendingCount: pendingRegistrations.length,
+        gatewayOrigin: selectedGatewayOrigin,
+        gatewayId: selectedGatewayId,
+        pendingCount: getPendingRegistrationCount(selectedGatewayOrigin),
         enqueuedWithProfile: !!relayProfileInfo
       });
     }
@@ -8946,7 +9323,7 @@ export async function disconnectRelay(relayKey) {
     await updateHealthState(); // Added await
     
     // Update gateway if connected
-    if (config.registerWithGateway && gatewayConnection) {
+    if (config.registerWithGateway && (gatewayConnection || gatewayConnectionsByOrigin.size > 0 || gatewayConnectionsById.size > 0)) {
       try {
         await registerWithGateway();
       } catch (regError) {

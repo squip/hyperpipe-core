@@ -3,6 +3,8 @@ import { EventEmitter } from 'node:events'
 import WebSocket from 'ws'
 
 import { GatewayService } from '../gateway/GatewayService.mjs'
+import HypercoreId from 'hypercore-id-encoding'
+import { activeRelays as relayManagerMap } from '../hyperpipe-relay-manager-adapter.mjs'
 
 function createSocket() {
   const ws = new EventEmitter()
@@ -280,6 +282,137 @@ test('GatewayService forwards blind peering key in hosted relay registration pay
       t.is(relayPayload?.metadata?.blindPeeringPublicKey, 'k44683wpzchhqfhwaq83qhqt59g4ymdz139hdk9hnhonc9h3ozxy')
     }
   } finally {
+    service.connectionPool?.destroy?.()
+  }
+})
+
+test('GatewayService exposes cached blind-peer catalog separately from authorized gateways', t => {
+  const service = new GatewayService({
+    publicGateway: {
+      enabled: true,
+      baseUrl: 'https://gateway-a.test',
+      gatewayBlindPeerCatalog: {
+        'https://gateway-a.test': {
+          gatewayOrigin: 'https://gateway-a.test',
+          gatewayId: 'gateway-a',
+          blindPeer: {
+            enabled: true,
+            publicKey: 'blind-peer-a'
+          },
+          updatedAt: 1
+        },
+        'https://gateway-b.test': {
+          gatewayOrigin: 'https://gateway-b.test',
+          gatewayId: 'gateway-b',
+          blindPeer: {
+            enabled: true,
+            publicKey: 'blind-peer-b'
+          },
+          updatedAt: 2
+        }
+      }
+    }
+  })
+
+  service.discoveredGateways = [{
+    gatewayId: 'gateway-a',
+    publicUrl: 'https://gateway-a.test'
+  }, {
+    gatewayId: 'gateway-b',
+    publicUrl: 'https://gateway-b.test'
+  }]
+  service.gatewayAccessCatalog = new Map([
+    ['gateway-a', {
+      gatewayId: 'gateway-a',
+      gatewayOrigin: 'https://gateway-a.test',
+      hostingState: 'approved'
+    }]
+  ])
+
+  const state = service.getPublicGatewayState()
+  t.ok(state.blindPeerCatalog)
+  t.ok(state.blindPeerCatalog['https://gateway-a.test'])
+  t.ok(state.blindPeerCatalog['https://gateway-b.test'])
+  t.is(state.authorizedGateways.length, 1)
+  t.is(state.authorizedGateways[0]?.gatewayId, 'gateway-a')
+})
+
+test('GatewayService includes the relay system core in hosted relay registration payloads', async t => {
+  const service = new GatewayService({ publicGateway: { enabled: true } })
+  const registerCalls = []
+  const relayKey = 'npubsystem:group-a'
+  const autobaseKey = Buffer.alloc(32, 21)
+  const systemKey = Buffer.alloc(32, 22)
+  const viewKey = Buffer.alloc(32, 23)
+
+  service.publicGatewaySettings.enabled = true
+  service.publicGatewaySettings.baseUrl = 'https://gateway.test'
+  service.publicGatewaySettings.sharedSecret = 'test-shared-secret'
+  service.discoveredGateways = [{
+    publicUrl: 'https://gateway.test',
+    authMethod: 'shared-secret-v1',
+    sharedSecret: 'test-shared-secret'
+  }]
+  service.publicGatewayLegacyRegistrars.set('https://gateway.test::test-shared-secret', {
+    isEnabled: () => true,
+    registerRelay: async (...args) => {
+      registerCalls.push(args)
+      return { success: true }
+    },
+    unregisterRelay: async () => ({ success: true }),
+    updateOpenJoinPool: async () => ({ success: true }),
+    issueGatewayToken: async () => ({ success: true }),
+    refreshGatewayToken: async () => ({ success: true }),
+    revokeGatewayToken: async () => ({ success: true })
+  })
+
+  relayManagerMap.set(relayKey, {
+    relay: {
+      key: autobaseKey,
+      system: { core: { key: systemKey } },
+      view: { core: { key: viewKey } }
+    }
+  })
+
+  try {
+    await service.registerPeerMetadata({
+      publicKey: 'peer-hosted-relay-system',
+      mode: 'hyperswarm',
+      relays: [
+        {
+          identifier: relayKey,
+          name: 'Hosted Group With System Core',
+          isHosted: true,
+          isJoined: false,
+          directJoinOnly: false,
+          isPublic: true,
+          isOpen: true
+        }
+      ]
+    }, {
+      source: 'test',
+      skipConnect: true
+    })
+
+    await service.syncPublicGatewayRelay(relayKey)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    t.ok(registerCalls.length >= 1, 'expected hosted relay to register with public gateway')
+    if (registerCalls.length) {
+      const [, relayPayload] = registerCalls[registerCalls.length - 1]
+      const relayCores = Array.isArray(relayPayload?.relayCores) ? relayPayload.relayCores : []
+      t.ok(relayCores.length >= 3, 'expected relay core metadata to be included')
+      t.ok(
+        relayCores.some((entry) => entry?.key === HypercoreId.encode(systemKey) && entry?.role === 'autobase-system'),
+        'expected the system core to be part of the registration payload'
+      )
+      t.ok(
+        relayCores.some((entry) => entry?.key === HypercoreId.encode(viewKey)),
+        'expected non-system relay cores to remain present'
+      )
+    }
+  } finally {
+    relayManagerMap.delete(relayKey)
     service.connectionPool?.destroy?.()
   }
 })

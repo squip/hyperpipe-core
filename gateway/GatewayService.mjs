@@ -517,7 +517,12 @@ export class GatewayService extends EventEmitter {
       blindPeerManualKeys: selectKeys('blindPeerManualKeys'),
       blindPeerEncryptionKey: selectString('blindPeerEncryptionKey'),
       blindPeerReplicationTopic: selectString('blindPeerReplicationTopic'),
-      blindPeerMaxBytes: selectNumber('blindPeerMaxBytes')
+      blindPeerMaxBytes: selectNumber('blindPeerMaxBytes'),
+      gatewayBlindPeerCatalog: this.#normalizeGatewayBlindPeerCatalog(
+        hasOwn(rawConfig, 'gatewayBlindPeerCatalog')
+          ? rawConfig.gatewayBlindPeerCatalog
+          : fallback?.gatewayBlindPeerCatalog
+      )
     };
   }
 
@@ -538,6 +543,39 @@ export class GatewayService extends EventEmitter {
     if (typeof value !== 'string') return null;
     const trimmed = value.trim();
     return trimmed.length ? trimmed : null;
+  }
+
+  #normalizeGatewayBlindPeerCatalog(value) {
+    if (!value || typeof value !== 'object') return {};
+    const entries = Object.entries(value);
+    const catalog = {};
+    for (const [rawKey, rawEntry] of entries) {
+      if (!rawEntry || typeof rawEntry !== 'object') continue;
+      const gatewayOrigin = this.#normalizeGatewayOrigin(
+        rawEntry.gatewayOrigin || rawEntry.publicUrl || rawKey || null
+      );
+      const gatewayId = this.#normalizeGatewayId(rawEntry.gatewayId || null);
+      const catalogKey = gatewayOrigin || gatewayId;
+      if (!catalogKey) continue;
+      const blindPeer =
+        rawEntry.blindPeer && typeof rawEntry.blindPeer === 'object'
+          ? {
+              enabled: rawEntry.blindPeer.enabled !== false,
+              publicKey: this.#sanitizeOptionalString(rawEntry.blindPeer.publicKey),
+              encryptionKey: this.#sanitizeOptionalString(rawEntry.blindPeer.encryptionKey),
+              maxBytes: Number.isFinite(Number(rawEntry.blindPeer.maxBytes))
+                ? Number(rawEntry.blindPeer.maxBytes)
+                : null
+            }
+          : null;
+      catalog[catalogKey] = {
+        gatewayOrigin,
+        gatewayId,
+        updatedAt: Number.isFinite(Number(rawEntry.updatedAt)) ? Number(rawEntry.updatedAt) : null,
+        blindPeer
+      };
+    }
+    return catalog;
   }
 
   #normalizeGatewayOrigin(value) {
@@ -2120,6 +2158,12 @@ export class GatewayService extends EventEmitter {
       || null;
     const relayCount = this.activeRelays?.size || 0;
     const replicaInfo = this.getPublicGatewayReplicaInfo();
+    const gatewayOrigin = this.#normalizeGatewayOrigin(
+      this.publicGatewaySettings?.baseUrl
+      || this.publicGatewaySettings?.preferredBaseUrl
+      || null
+    );
+    const gatewayId = this.#normalizeGatewayId(this.publicGatewaySettings?.resolvedGatewayId || this.publicGatewaySettings?.selectedGatewayId || null);
 
     const payload = {
       role: PUBLIC_GATEWAY_VIRTUAL_RELAY_ENABLED ? 'gateway-replica' : 'relay-peer',
@@ -2130,6 +2174,14 @@ export class GatewayService extends EventEmitter {
       delegateReqToPeers: !!this.publicGatewaySettings?.delegateReqToPeers,
       isServer: !!isServer
     };
+
+    if (gatewayOrigin) {
+      payload.gatewayOrigin = gatewayOrigin;
+      payload.publicUrl = gatewayOrigin;
+    }
+    if (gatewayId) {
+      payload.gatewayId = gatewayId;
+    }
 
     if (replicaInfo) {
       payload.hyperbeeKey = replicaInfo.hyperbeeKey || null;
@@ -2562,6 +2614,7 @@ export class GatewayService extends EventEmitter {
         trustedPeers: Array.isArray(summary?.trustedPeers) ? summary.trustedPeers : [],
         summary: summary || null
       },
+      blindPeerCatalog: cloneJson(config.gatewayBlindPeerCatalog || {}),
       wsBase: enabled ? (config.resolvedWsUrl || this.publicGatewayWsBase) : null,
       lastUpdatedAt: this.publicGatewayStatusUpdatedAt,
       relays,
@@ -3244,6 +3297,8 @@ export class GatewayService extends EventEmitter {
 
     if (autobase) {
       addCore(autobase, 'autobase');
+      addCore(autobase?.system || autobase?.system?.core, 'autobase-system');
+      addCore(autobase?.system?.core, 'autobase-system-core');
       addCore(autobase?.core, 'autobase-core');
       addCore(autobase?.local || autobase?.local?.core, 'autobase-local');
       addCore(autobase?.localInput || autobase?.localInput?.core, 'autobase-local');
@@ -3917,6 +3972,23 @@ export class GatewayService extends EventEmitter {
     peer.lastSeen = Date.now();
 
     updatedRelays.forEach(identifier => {
+      const syncTraceId = `relay-sync-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`
+      const relayMetadata = this.activeRelays.get(identifier)?.metadata || null
+      this.#resolveGatewayRoute({ relayKey: identifier, metadata: relayMetadata }).then((route) => {
+        this.log('info', `[PublicGateway] Relay sync scheduled ${syncTraceId} relay=${identifier}`, {
+          source,
+          skipConnect,
+          gatewayOrigin: route?.gatewayOrigin || relayMetadata?.gatewayOrigin || null,
+          gatewayId: route?.gatewayId || relayMetadata?.gatewayId || null,
+          isHosted: relayMetadata?.isHosted ?? null,
+          isJoined: relayMetadata?.isJoined ?? null,
+          isOpen: relayMetadata?.isOpen ?? null,
+          isPublic: relayMetadata?.isPublic ?? null,
+          peerCount: this.activeRelays.get(identifier)?.peers?.size || 0
+        });
+      }).catch((error) => {
+        this.log('warn', `[PublicGateway] Relay route trace failed ${syncTraceId} relay=${identifier}: ${error.message}`);
+      });
       this.#syncPublicGatewayRelay(identifier, { forceTokenRefresh: true }).catch(error => {
         this.log('warn', `[PublicGateway] Sync error for ${identifier}: ${error.message}`);
       });

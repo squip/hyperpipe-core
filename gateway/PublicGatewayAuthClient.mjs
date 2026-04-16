@@ -53,6 +53,17 @@ function clonePayload(value) {
     : value
 }
 
+function createTraceId(prefix = 'pg-auth') {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`
+}
+
+function previewValue(value, length = 16) {
+  if (typeof value !== 'string') return value ?? null
+  const trimmed = value.trim()
+  if (!trimmed) return null
+  return trimmed.length > length ? trimmed.slice(0, length) : trimmed
+}
+
 export default class PublicGatewayAuthClient {
   constructor({
     baseUrl = null,
@@ -100,6 +111,7 @@ export default class PublicGatewayAuthClient {
     if (!this.isEnabled()) {
       throw new Error('public-gateway-auth-disabled')
     }
+    const traceId = createTraceId()
     const authContext = this.getAuthContext() || {}
     const pubkey = normalizePubkey(authContext.pubkey)
     const nsecHex = typeof authContext.nsecHex === 'string' ? authContext.nsecHex.trim() : ''
@@ -111,6 +123,14 @@ export default class PublicGatewayAuthClient {
     if (!forceRefresh) {
       const cached = this.tokenCache.get(cacheKey)
       if (cached && cached.token && cached.expiresAt > Date.now() + 2_000) {
+        this.logger.info('Public gateway auth token cache hit', {
+          traceId,
+          baseUrl: this.baseUrl,
+          scope,
+          relayKey: relayKey || null,
+          pubkey: previewValue(pubkey),
+          expiresAt: cached.expiresAt
+        })
         return clonePayload(cached.response)
       }
     }
@@ -118,17 +138,52 @@ export default class PublicGatewayAuthClient {
     if (!secretBytes) {
       throw new Error('public-gateway-auth-context-invalid')
     }
+    const derivedPubkey = Buffer.from(schnorr.getPublicKey(secretBytes)).toString('hex').toLowerCase()
+    const derivedMatchesRequested = derivedPubkey === pubkey
+    this.logger.info('Public gateway auth token issuance start', {
+      traceId,
+      baseUrl: this.baseUrl,
+      scope,
+      relayKey: relayKey || null,
+      requestedPubkey: previewValue(pubkey),
+      derivedPubkey: previewValue(derivedPubkey),
+      derivedMatchesRequested
+    })
+    if (!derivedMatchesRequested) {
+      this.logger.warn('Public gateway auth context pubkey mismatch', {
+        traceId,
+        baseUrl: this.baseUrl,
+        scope,
+        relayKey: relayKey || null,
+        requestedPubkey: previewValue(pubkey),
+        derivedPubkey: previewValue(derivedPubkey)
+      })
+    }
 
     const challengePayload = await this.#request('/api/auth/challenge', {
       pubkey,
       scope,
       relayKey: relayKey || null
+    }, {
+      traceId,
+      stage: 'challenge',
+      scope,
+      relayKey: relayKey || null,
+      pubkey
     })
     const challengeId = typeof challengePayload.challengeId === 'string' ? challengePayload.challengeId.trim() : ''
     const nonce = typeof challengePayload.nonce === 'string' ? challengePayload.nonce : ''
     if (!challengeId || !nonce) {
       throw new Error('public-gateway-auth-challenge-invalid')
     }
+    this.logger.info('Public gateway auth challenge accepted', {
+      traceId,
+      baseUrl: this.baseUrl,
+      scope,
+      relayKey: relayKey || null,
+      challengeId: previewValue(challengeId),
+      nonce: previewValue(nonce, 24)
+    })
 
     const signature = toHex(await schnorr.sign(new TextEncoder().encode(nonce), secretBytes))
     const verifyPayload = await this.#request('/api/auth/verify', {
@@ -137,6 +192,13 @@ export default class PublicGatewayAuthClient {
       signature,
       scope,
       relayKey: relayKey || null
+    }, {
+      traceId,
+      stage: 'verify',
+      scope,
+      relayKey: relayKey || null,
+      pubkey,
+      challengeId
     })
     const token = typeof verifyPayload.token === 'string' ? verifyPayload.token.trim() : ''
     if (!token) {
@@ -161,6 +223,16 @@ export default class PublicGatewayAuthClient {
       subjectPubkey: pubkey,
       response
     })
+    this.logger.info('Public gateway auth token issuance complete', {
+      traceId,
+      baseUrl: this.baseUrl,
+      scope,
+      relayKey: relayKey || null,
+      token: previewValue(token, 24),
+      expiresIn,
+      expiresAt: response.expiresAt,
+      hasOperatorIdentity: !!response.operatorIdentity
+    })
     return clonePayload(response)
   }
 
@@ -174,22 +246,55 @@ export default class PublicGatewayAuthClient {
     return `${this.#buildCachePrefix(scope, relayKey)}${normalizePubkey(pubkey) || '*'}`
   }
 
-  async #request(pathname, payload) {
+  async #request(pathname, payload, meta = {}) {
     if (!this.baseUrl || !this.fetchImpl) {
       throw new Error('public-gateway-auth-disabled')
     }
     const url = `${this.baseUrl}${pathname}`
+    this.logger.info('Public gateway auth request start', {
+      traceId: meta.traceId || null,
+      stage: meta.stage || null,
+      baseUrl: this.baseUrl,
+      pathname,
+      scope: meta.scope || null,
+      relayKey: meta.relayKey || null,
+      pubkey: previewValue(meta.pubkey),
+      challengeId: previewValue(meta.challengeId)
+    })
     const response = await this.fetchImpl(url, {
       method: 'POST',
       headers: {
-        'content-type': 'application/json'
+        'content-type': 'application/json',
+        'x-hyperpipe-client-trace-id': meta.traceId || createTraceId('pg-auth-http')
       },
       body: JSON.stringify(payload || {})
     })
     const data = await parseResponsePayload(response)
+    this.logger.info('Public gateway auth request response', {
+      traceId: meta.traceId || null,
+      stage: meta.stage || null,
+      baseUrl: this.baseUrl,
+      pathname,
+      status: response.status,
+      ok: response.ok,
+      error: typeof data?.error === 'string' ? data.error : null,
+      challengeId: previewValue(typeof data?.challengeId === 'string' ? data.challengeId : null),
+      hasNonce: typeof data?.nonce === 'string' && data.nonce.length > 0,
+      hasToken: typeof data?.token === 'string' && data.token.length > 0
+    })
     if (!response.ok) {
       const message = typeof data.error === 'string' ? data.error : `HTTP ${response.status}`
-      this.logger.warn('Public gateway auth request failed', { pathname, status: response.status, message })
+      this.logger.warn('Public gateway auth request failed', {
+        traceId: meta.traceId || null,
+        stage: meta.stage || null,
+        pathname,
+        status: response.status,
+        message,
+        scope: meta.scope || null,
+        relayKey: meta.relayKey || null,
+        pubkey: previewValue(meta.pubkey),
+        challengeId: previewValue(meta.challengeId)
+      })
       throw new Error(message)
     }
     return data

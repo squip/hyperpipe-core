@@ -69,7 +69,9 @@ import { loadGatewaySettings, getCachedGatewaySettings, updateGatewaySettings } 
 import {
   loadPublicGatewaySettings,
   updatePublicGatewaySettings,
-  getCachedPublicGatewaySettings
+  getCachedPublicGatewaySettings,
+  setPublicGatewaySettingsNodeStorage,
+  PUBLIC_GATEWAY_SETTINGS_FILENAME
 } from '@squip/hyperpipe-bridge/config/PublicGatewaySettings'
 import {
   downloadGroupFileOperation,
@@ -165,6 +167,11 @@ const pearRuntime = globalThis?.Pear
 const __dirname = process.env.APP_DIR || pearRuntime?.config?.dir || process.cwd()
 const defaultStorageDir = process.env.STORAGE_DIR || pearRuntime?.config?.storage || join(process.cwd(), 'data')
 const userKey = process.env.USER_KEY || null
+
+setPublicGatewaySettingsNodeStorage({
+  filePath: join(defaultStorageDir, PUBLIC_GATEWAY_SETTINGS_FILENAME),
+  legacyFilePath: join(defaultStorageDir, PUBLIC_GATEWAY_SETTINGS_FILENAME)
+})
 
 function isEnvEnabled(value, defaultValue = false) {
   if (typeof value !== 'string') return defaultValue
@@ -2210,13 +2217,28 @@ async function syncActiveRelayCoreRefs({
   }
   const relayCorestore = relayManager?.store || null
   if (manager?.started && mirrorEligible && !coreRefsAlreadySynced) {
-    manager.ensureRelayMirror({
+    const mirrorKeys = await resolveRelayScopedMirrorKeys({
       relayKey,
       publicIdentifier: identifier,
-      autobase: relayManager.relay,
-      coreRefs: normalized,
-      corestore: relayCorestore
+      reason,
+      allowFallback: false
     })
+    if (mirrorKeys.length > 0) {
+      manager.ensureRelayMirror({
+        relayKey,
+        publicIdentifier: identifier,
+        autobase: relayManager.relay,
+        coreRefs: normalized,
+        corestore: relayCorestore,
+        mirrorKeys
+      })
+    } else {
+      console.warn('[Worker] Hosted relay mirror sync skipped (no relay-scoped mirror target)', {
+        relayKey,
+        publicIdentifier: identifier,
+        reason
+      })
+    }
     if (isFastWriterSyncReason) {
       console.log('[Worker] Mirror sync fast-path enabled', {
         relayKey,
@@ -2235,14 +2257,25 @@ async function syncActiveRelayCoreRefs({
     && !coreRefsAlreadySynced
     && !isFastWriterSyncReason
   ) {
-    primeSummary = await manager.primeRelayCoreRefs({
+    const mirrorKeys = await resolveRelayScopedMirrorKeys({
       relayKey,
       publicIdentifier: identifier,
-      coreRefs: normalized,
-      timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
-      reason,
-      corestore: relayCorestore
+      reason: `${reason}-prime`,
+      allowFallback: false
     })
+    if (mirrorKeys.length > 0) {
+      primeSummary = await manager.primeRelayCoreRefs({
+        relayKey,
+        publicIdentifier: identifier,
+        coreRefs: normalized,
+        timeoutMs: BLIND_PEER_REHYDRATION_TIMEOUT_MS,
+        reason,
+        corestore: relayCorestore,
+        mirrorKeys
+      })
+    } else {
+      primeSummary = { status: 'skipped', reason: 'no-relay-scoped-mirror-target' }
+    }
   }
 
   const rehydrateSummary = manager?.started && mirrorEligible && !coreRefsAlreadySynced && !isFastWriterSyncReason
@@ -2286,6 +2319,122 @@ function blindPeerFingerprint(blindPeer) {
     blindPeer.replicationTopic || '',
     maxBytes
   ].join('|')
+}
+
+function normalizeBlindPeerCatalogKey({ gatewayOrigin = null, gatewayId = null } = {}) {
+  return normalizeHttpOrigin(gatewayOrigin) || normalizeGatewayId(gatewayId) || null
+}
+
+function getRelayScopedBlindPeerKeys({ relayKey = null, publicIdentifier = null } = {}) {
+  const keys = []
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey || null)
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : null
+  if (normalizedRelayKey) keys.push(`relay:${normalizedRelayKey}`)
+  if (normalizedPublicIdentifier) keys.push(`public:${normalizedPublicIdentifier}`)
+  return keys
+}
+
+function getRelayScopedBlindPeerEntry({ relayKey = null, publicIdentifier = null } = {}) {
+  const identityKeys = getRelayScopedBlindPeerKeys({ relayKey, publicIdentifier })
+  for (const key of identityKeys) {
+    const entry = relayScopedBlindPeers.get(key)
+    if (entry?.blindPeer?.publicKey) return entry
+  }
+  return null
+}
+
+function buildGatewayBlindPeerCatalogSnapshot() {
+  const snapshot = {}
+  for (const [key, entry] of gatewayBlindPeerCatalog.entries()) {
+    if (!entry?.blindPeer?.publicKey) continue
+    snapshot[key] = {
+      gatewayOrigin: entry.gatewayOrigin || null,
+      gatewayId: entry.gatewayId || null,
+      blindPeer: { ...entry.blindPeer },
+      updatedAt: Number.isFinite(Number(entry.updatedAt)) ? Number(entry.updatedAt) : Date.now()
+    }
+  }
+  return snapshot
+}
+
+function hydrateGatewayBlindPeerCatalog(settings = publicGatewaySettings) {
+  gatewayBlindPeerCatalog.clear()
+  const catalog = settings?.gatewayBlindPeerCatalog
+  if (!catalog || typeof catalog !== 'object') return
+  for (const value of Object.values(catalog)) {
+    if (!value || typeof value !== 'object') continue
+    const blindPeer = sanitizeBlindPeerMeta(value.blindPeer)
+    if (!blindPeer?.publicKey) continue
+    const gatewayOrigin = normalizeHttpOrigin(value.gatewayOrigin || null)
+    const gatewayId = normalizeGatewayId(value.gatewayId || null)
+    const catalogKey = normalizeBlindPeerCatalogKey({ gatewayOrigin, gatewayId })
+    if (!catalogKey) continue
+    gatewayBlindPeerCatalog.set(catalogKey, {
+      gatewayOrigin,
+      gatewayId,
+      blindPeer,
+      updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : Date.now()
+    })
+  }
+}
+
+async function rememberGatewayBlindPeerCatalogEntry({
+  gatewayOrigin = null,
+  gatewayId = null,
+  blindPeer = null,
+  reason = 'runtime',
+  persist = true
+} = {}) {
+  const normalizedOrigin = normalizeHttpOrigin(gatewayOrigin)
+  const normalizedGatewayId = normalizeGatewayId(gatewayId)
+  const sanitizedBlindPeer = sanitizeBlindPeerMeta(blindPeer)
+  const catalogKey = normalizeBlindPeerCatalogKey({
+    gatewayOrigin: normalizedOrigin,
+    gatewayId: normalizedGatewayId
+  })
+
+  if (!catalogKey || !sanitizedBlindPeer?.publicKey) {
+    return { status: 'skipped', reason: 'missing-gateway-or-blind-peer' }
+  }
+
+  const previous = gatewayBlindPeerCatalog.get(catalogKey) || null
+  const changed =
+    !previous
+    || previous.gatewayOrigin !== normalizedOrigin
+    || previous.gatewayId !== normalizedGatewayId
+    || blindPeerFingerprint(previous.blindPeer) !== blindPeerFingerprint(sanitizedBlindPeer)
+
+  const entry = {
+    gatewayOrigin: normalizedOrigin,
+    gatewayId: normalizedGatewayId,
+    blindPeer: sanitizedBlindPeer,
+    updatedAt: Date.now(),
+    reason
+  }
+  gatewayBlindPeerCatalog.set(catalogKey, entry)
+
+  if (changed && persist && publicGatewaySettings) {
+    publicGatewaySettings = await updatePublicGatewaySettings({
+      gatewayBlindPeerCatalog: buildGatewayBlindPeerCatalogSnapshot(),
+      blindPeerKeys: []
+    })
+  }
+
+  return {
+    status: 'ok',
+    changed,
+    catalogKey,
+    entry
+  }
+}
+
+function buildPublicGatewayStatusState(state = null) {
+  const nextState = state && typeof state === 'object' ? { ...state } : {}
+  nextState.blindPeerCatalog = buildGatewayBlindPeerCatalogSnapshot()
+  return nextState
 }
 
 function normalizeHttpOrigin(candidate) {
@@ -5505,7 +5654,292 @@ async function ensurePublicGatewaySettingsLoaded() {
   if (publicGatewaySettings && typeof publicGatewaySettings.delegateReqToPeers !== 'boolean') {
     publicGatewaySettings.delegateReqToPeers = false
   }
+  hydrateGatewayBlindPeerCatalog(publicGatewaySettings)
   return publicGatewaySettings
+}
+
+function getEffectivePublicGatewaySettings(settings = publicGatewaySettings) {
+  const baseSettings = settings && typeof settings === 'object' ? settings : {}
+  const manualKeys = Array.isArray(baseSettings.blindPeerManualKeys)
+    ? Array.from(new Set(baseSettings.blindPeerManualKeys.filter(Boolean)))
+    : []
+  return {
+    ...baseSettings,
+    blindPeerEnabled:
+      baseSettings.blindPeerEnabled === true
+      || manualKeys.length > 0
+      || gatewayBlindPeerCatalog.size > 0
+      || relayScopedBlindPeers.size > 0,
+    blindPeerKeys: [],
+    blindPeerManualKeys: manualKeys
+  }
+}
+
+async function fetchGatewayBlindPeerSummaryForOrigin(gatewayOrigin, {
+  reason = 'runtime'
+} = {}) {
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin)
+  if (!normalizedGatewayOrigin) {
+    return null
+  }
+
+  try {
+    const target = new URL('/api/blind-peer', normalizedGatewayOrigin)
+    const response = await fetch(target, {
+      headers: {
+        accept: 'application/json'
+      }
+    })
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`)
+    }
+    const payload = await response.json()
+    const summary = payload?.summary || payload?.status || null
+    const blindPeer = sanitizeBlindPeerMeta({
+      publicKey: summary?.publicKey || null,
+      encryptionKey: summary?.encryptionKey || null,
+      replicationTopic: summary?.config?.replicationTopic || null,
+      maxBytes: summary?.config?.maxBytes ?? null
+    })
+
+    if (blindPeer?.publicKey) {
+      console.log('[Worker] Gateway blind-peer summary fetched for explicit relay route', {
+        gatewayOrigin: normalizedGatewayOrigin,
+        reason,
+        blindPeerKey: previewValue(blindPeer.publicKey, 16),
+        hasEncryptionKey: !!blindPeer.encryptionKey
+      })
+    } else {
+      console.warn('[Worker] Gateway blind-peer summary missing public key for explicit relay route', {
+        gatewayOrigin: normalizedGatewayOrigin,
+        reason
+      })
+    }
+    return blindPeer
+  } catch (error) {
+    console.warn('[Worker] Failed to fetch gateway blind-peer summary for explicit relay route', {
+      gatewayOrigin: normalizedGatewayOrigin,
+      reason,
+      error: error?.message || error
+    })
+    return null
+  }
+}
+
+async function primeRelayScopedBlindPeerForCreateRoute(gatewayOrigin, {
+  relayKey = null,
+  gatewayId = null,
+  publicIdentifier = null,
+  reason = 'create-relay-input'
+} = {}) {
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin)
+  if (!normalizedGatewayOrigin) {
+    return { status: 'skipped', reason: 'missing-gateway-origin' }
+  }
+
+  const blindPeer = await fetchGatewayBlindPeerSummaryForOrigin(normalizedGatewayOrigin, {
+    reason
+  })
+  if (!blindPeer?.publicKey) {
+    return { status: 'skipped', reason: 'missing-blind-peer-key' }
+  }
+
+  const remembered = await rememberRelayScopedBlindPeer(blindPeer, {
+    relayKey,
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId,
+    publicIdentifier,
+    reason,
+    activateRuntime: false
+  })
+  console.log('[Worker] Primed relay-scoped blind peer before create relay', {
+    gatewayOrigin: normalizedGatewayOrigin,
+    relayKey,
+    publicIdentifier,
+    reason,
+    status: remembered?.status || null,
+    blindPeerKey: previewValue(blindPeer.publicKey, 16)
+  })
+  return {
+    status: 'ok',
+    blindPeer
+  }
+}
+
+async function rememberRelayScopedBlindPeer(blindPeer, {
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigin = null,
+  gatewayId = null,
+  reason = 'runtime',
+  activateRuntime = false,
+  persistCatalog = true
+} = {}) {
+  const nextBlindPeer = sanitizeBlindPeerMeta(blindPeer)
+  const blindPeerKey = typeof nextBlindPeer?.publicKey === 'string'
+    ? nextBlindPeer.publicKey.trim().toLowerCase()
+    : null
+
+  if (!blindPeerKey) {
+    return { status: 'skipped', reason: 'missing-public-key' }
+  }
+
+  const normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin)
+  const normalizedGatewayId = normalizeGatewayId(gatewayId)
+  await rememberGatewayBlindPeerCatalogEntry({
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizedGatewayId,
+    blindPeer: nextBlindPeer,
+    reason,
+    persist: persistCatalog
+  }).catch((error) => {
+    console.warn('[Worker] Failed to update gateway blind-peer catalog entry', {
+      relayKey,
+      publicIdentifier,
+      gatewayOrigin: normalizedGatewayOrigin,
+      gatewayId: normalizedGatewayId,
+      reason,
+      error: error?.message || error
+    })
+  })
+
+  const entry = {
+    relayKey: normalizeRelayKeyHex(relayKey || null) || null,
+    publicIdentifier:
+      typeof publicIdentifier === 'string' && publicIdentifier.trim()
+        ? publicIdentifier.trim()
+        : null,
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizedGatewayId,
+    blindPeer: nextBlindPeer,
+    updatedAt: Date.now(),
+    reason
+  }
+  const identityKeys = getRelayScopedBlindPeerKeys(entry)
+  for (const identityKey of identityKeys) {
+    relayScopedBlindPeers.set(identityKey, entry)
+  }
+
+  if (activateRuntime) {
+    const effectiveSettings = getEffectivePublicGatewaySettings()
+    const manager = await ensureBlindPeeringManager().catch(() => null)
+    if (manager) {
+      manager.configure(effectiveSettings)
+      manager.markTrustedMirrors([blindPeerKey])
+      if (manager.enabled && !manager.started) {
+        try {
+          await manager.start({
+            corestore: getCorestore(),
+            wakeup: null
+          })
+        } catch (error) {
+          console.warn('[Worker] Failed to start blind peering manager for relay-scoped blind peer:', {
+            relayKey: entry.relayKey,
+            publicIdentifier: entry.publicIdentifier,
+            gatewayOrigin: normalizedGatewayOrigin,
+            gatewayId: normalizedGatewayId,
+            reason,
+            blindPeerKey: previewValue(blindPeerKey, 16),
+            error: error?.message || error
+          })
+        }
+      }
+    }
+  }
+
+  console.log('[Worker] Remembered relay-scoped blind peer', {
+    relayKey: entry.relayKey,
+    publicIdentifier: entry.publicIdentifier,
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizedGatewayId,
+    reason,
+    activateRuntime,
+    blindPeerKey: previewValue(blindPeerKey, 16),
+    relayScopedBlindPeerCount: relayScopedBlindPeers.size
+  })
+
+  return {
+    status: 'ok',
+    relayKey: entry.relayKey,
+    publicIdentifier: entry.publicIdentifier,
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizedGatewayId,
+    blindPeerKey,
+    activateRuntime
+  }
+}
+
+async function resolveRelayScopedMirrorKeys({
+  relayKey = null,
+  publicIdentifier = null,
+  gatewayOrigin = null,
+  gatewayId = null,
+  reason = 'relay-mirror',
+  allowFallback = true
+} = {}) {
+  const normalizedRelayKey = normalizeRelayKeyHex(relayKey || null) || null
+  const normalizedPublicIdentifier =
+    typeof publicIdentifier === 'string' && publicIdentifier.trim()
+      ? publicIdentifier.trim()
+      : null
+  let normalizedGatewayOrigin = normalizeHttpOrigin(gatewayOrigin)
+  let normalizedGatewayId = normalizeGatewayId(gatewayId)
+
+  if (!normalizedGatewayOrigin && !normalizedGatewayId) {
+    const route = await getRelayGatewayRoute({
+      relayKey: normalizedRelayKey,
+      publicIdentifier: normalizedPublicIdentifier
+    }).catch(() => null)
+    if (route?.directJoinOnly) return []
+    normalizedGatewayOrigin = normalizeHttpOrigin(route?.gatewayOrigin || null)
+    normalizedGatewayId = normalizeGatewayId(route?.gatewayId || null)
+  }
+
+  const relayEntry = getRelayScopedBlindPeerEntry({
+    relayKey: normalizedRelayKey,
+    publicIdentifier: normalizedPublicIdentifier
+  })
+  if (
+    relayEntry?.blindPeer?.publicKey
+    && (!normalizedGatewayOrigin || relayEntry.gatewayOrigin === normalizedGatewayOrigin)
+    && (!normalizedGatewayId || relayEntry.gatewayId === normalizedGatewayId)
+  ) {
+    return [relayEntry.blindPeer.publicKey]
+  }
+
+  const catalogKey = normalizeBlindPeerCatalogKey({
+    gatewayOrigin: normalizedGatewayOrigin,
+    gatewayId: normalizedGatewayId
+  })
+  const catalogEntry = catalogKey ? (gatewayBlindPeerCatalog.get(catalogKey) || null) : null
+  if (catalogEntry?.blindPeer?.publicKey) {
+    return [catalogEntry.blindPeer.publicKey]
+  }
+
+  if (normalizedGatewayOrigin) {
+    const fetchedBlindPeer = await fetchGatewayBlindPeerSummaryForOrigin(normalizedGatewayOrigin, { reason })
+    if (fetchedBlindPeer?.publicKey) {
+      await rememberGatewayBlindPeerCatalogEntry({
+        gatewayOrigin: normalizedGatewayOrigin,
+        gatewayId: normalizedGatewayId,
+        blindPeer: fetchedBlindPeer,
+        reason,
+        persist: true
+      })
+      return [fetchedBlindPeer.publicKey]
+    }
+  }
+
+  if (!allowFallback) return []
+
+  const fallbackOrigin = normalizeHttpOrigin(
+    publicGatewaySettings?.baseUrl
+    || publicGatewaySettings?.preferredBaseUrl
+    || null
+  )
+  const fallbackCatalogKey = normalizeBlindPeerCatalogKey({ gatewayOrigin: fallbackOrigin })
+  const fallbackEntry = fallbackCatalogKey ? (gatewayBlindPeerCatalog.get(fallbackCatalogKey) || null) : null
+  return fallbackEntry?.blindPeer?.publicKey ? [fallbackEntry.blindPeer.publicKey] : []
 }
 
 async function ensureBlindPeeringManager(runtime = {}) {
@@ -5516,7 +5950,7 @@ async function ensureBlindPeeringManager(runtime = {}) {
   if (!blindPeeringManager) {
     blindPeeringManager = new BlindPeeringManager({
       logger: console,
-      settingsProvider: () => publicGatewaySettings,
+      settingsProvider: () => getEffectivePublicGatewaySettings(),
       onLocalIdentityAvailable: (blindPeerKey) => {
         pendingGatewayMetadataSync = true
         console.log('[Worker] Blind peering identity became available', {
@@ -5544,7 +5978,7 @@ async function ensureBlindPeeringManager(runtime = {}) {
   }
 
   blindPeeringManager.setMetadataPath(metadataPath)
-  blindPeeringManager.configure(publicGatewaySettings)
+  blindPeeringManager.configure(getEffectivePublicGatewaySettings())
 
   if (runtime.start === true) {
     await blindPeeringManager.start({
@@ -5613,13 +6047,27 @@ async function seedBlindPeeringMirrors(manager) {
       relayKey,
       publicIdentifier
     )
-    manager.ensureRelayMirror({
+    const mirrorKeys = await resolveRelayScopedMirrorKeys({
       relayKey,
       publicIdentifier,
-      autobase: relayManager.relay,
-      coreRefs: storedCoreRefs,
-      corestore: relayManager.store || null
+      reason: 'seed-blind-peering-mirrors',
+      allowFallback: false
     })
+    if (mirrorKeys.length > 0) {
+      manager.ensureRelayMirror({
+        relayKey,
+        publicIdentifier,
+        autobase: relayManager.relay,
+        coreRefs: storedCoreRefs,
+        corestore: relayManager.store || null,
+        mirrorKeys
+      })
+    } else {
+      console.warn('[Worker] Hosted relay mirror seed skipped (no relay-scoped mirror target)', {
+        relayKey,
+        publicIdentifier
+      })
+    }
     attachRelayMirrorHooks(relayKey, relayManager, manager)
   }
   if (typeof manager.logTransportSnapshot === 'function') {
@@ -5676,14 +6124,27 @@ function attachRelayMirrorHooks(relayKey, relayManager, manager) {
       const fingerprint = normalizedRefs.join(',')
       const refsChanged = fingerprint !== lastCoreFingerprint
       const elapsedSinceLast = lastRunAt > 0 ? Date.now() - lastRunAt : Number.POSITIVE_INFINITY
-
-      manager.ensureRelayMirror({
+      const mirrorKeys = await resolveRelayScopedMirrorKeys({
         relayKey,
         publicIdentifier,
-        autobase,
-        coreRefs,
-        corestore: relayManager?.store || null
+        reason: 'relay-update',
+        allowFallback: false
       })
+      if (mirrorKeys.length > 0) {
+        manager.ensureRelayMirror({
+          relayKey,
+          publicIdentifier,
+          autobase,
+          coreRefs,
+          corestore: relayManager?.store || null,
+          mirrorKeys
+        })
+      } else {
+        manager.logger?.warn?.('[BlindPeering] Relay update skipped mirror publish (no relay-scoped mirror target)', {
+          relayKey,
+          publicIdentifier
+        })
+      }
 
       if (!refsChanged && elapsedSinceLast < RELAY_MIRROR_UPDATE_MIN_INTERVAL_MS) {
         manager.logger?.debug?.('[BlindPeering] Relay update sync throttled (no core-ref changes)', {
@@ -5805,7 +6266,7 @@ async function startGatewayService(options = {}) {
     gatewayService.on('status', async (status) => {
       gatewayStatusCache = status
       if (status?.publicGateway) {
-        publicGatewayStatusCache = status.publicGateway
+        publicGatewayStatusCache = buildPublicGatewayStatusState(status.publicGateway)
       }
       sendMessage({ type: 'gateway-status', status })
       maybeReauthOpenJoins(status).catch((err) => {
@@ -5839,9 +6300,11 @@ async function startGatewayService(options = {}) {
       }
     })
     gatewayService.on('public-gateway-status', async (state) => {
-      publicGatewayStatusCache = state
-      sendMessage({ type: 'public-gateway-status', state })
-      if (!state?.blindPeer) return
+      if (!state?.blindPeer) {
+        publicGatewayStatusCache = buildPublicGatewayStatusState(state)
+        sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
+        return
+      }
 
       try {
         const blindPeerState = state.blindPeer || {}
@@ -5853,29 +6316,54 @@ async function startGatewayService(options = {}) {
         const manualKeys = Array.isArray(previousSettings.blindPeerManualKeys)
           ? previousSettings.blindPeerManualKeys.filter(Boolean)
           : []
+        const gatewayOrigin = normalizeHttpOrigin(
+          state.baseUrl
+          || state.preferredBaseUrl
+          || null
+        )
+        const gatewayId = normalizeGatewayId(state.resolvedGatewayId || state.selectedGatewayId || null)
 
         publicGatewaySettings = {
           ...previousSettings,
           blindPeerEnabled: summary?.enabled ?? !!blindPeerState.enabled,
-          blindPeerKeys: remoteKeys,
+          blindPeerKeys: [],
           blindPeerManualKeys: manualKeys,
           blindPeerEncryptionKey: summary?.encryptionKey || blindPeerState.encryptionKey || null,
-          blindPeerMaxBytes: blindPeerState.maxBytes ?? previousSettings.blindPeerMaxBytes ?? null
+          blindPeerMaxBytes: blindPeerState.maxBytes ?? previousSettings.blindPeerMaxBytes ?? null,
+          gatewayBlindPeerCatalog: previousSettings.gatewayBlindPeerCatalog || {}
         }
+        if (summary?.publicKey) {
+          await rememberGatewayBlindPeerCatalogEntry({
+            gatewayOrigin,
+            gatewayId,
+            blindPeer: {
+              publicKey: summary.publicKey,
+              encryptionKey: summary.encryptionKey || null,
+              replicationTopic: summary?.config?.replicationTopic || null,
+              maxBytes: summary?.config?.maxBytes ?? blindPeerState.maxBytes ?? null
+            },
+            reason: 'public-gateway-status',
+            persist: true
+          })
+        }
+        publicGatewayStatusCache = buildPublicGatewayStatusState(state)
+        sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
 
         console.log('[Worker] Public gateway blind-peer status update', {
           enabled: publicGatewaySettings.blindPeerEnabled === true,
           running: summary?.running === true,
           remoteKeys: remoteKeys.length,
           manualKeys: manualKeys.length,
+          catalogEntries: gatewayBlindPeerCatalog.size,
+          gatewayOrigin,
+          gatewayId,
           trackedCores: Number.isFinite(summary?.metadataTracked) ? Number(summary.metadataTracked) : null,
-          trustedPeerCount: Number.isFinite(summary?.trustedPeerCount) ? Number(summary.trustedPeerCount) : null,
-          publicKey: previewValue(summary?.publicKey, 16)
+          trustedPeerCount: Number.isFinite(summary?.trustedPeerCount) ? Number(summary.trustedPeerCount) : null
         })
 
+        const effectiveSettings = getEffectivePublicGatewaySettings(publicGatewaySettings)
         const manager = await ensureBlindPeeringManager()
-        manager.configure(publicGatewaySettings)
-        manager.markTrustedMirrors(remoteKeys)
+        manager.configure(effectiveSettings)
 
         const dispatcherAssignments = Array.isArray(blindPeerState.dispatcherAssignments)
           ? blindPeerState.dispatcherAssignments
@@ -5992,7 +6480,7 @@ async function startGatewayService(options = {}) {
 
   await gatewayService.updatePublicGatewayConfig(publicGatewaySettings)
   sendMessage({ type: 'public-gateway-config', config: publicGatewaySettings })
-  publicGatewayStatusCache = gatewayService.getPublicGatewayState()
+  publicGatewayStatusCache = buildPublicGatewayStatusState(gatewayService.getPublicGatewayState())
   sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
 
   const incomingOptions = options && typeof options === 'object' ? options : {}
@@ -6074,7 +6562,7 @@ async function stopGatewayService() {
   if (!gatewayService) return
   try {
     await gatewayService.stop()
-    publicGatewayStatusCache = gatewayService.getPublicGatewayState()
+    publicGatewayStatusCache = buildPublicGatewayStatusState(gatewayService.getPublicGatewayState())
     sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
     if (blindPeeringManager) {
       await blindPeeringManager.stop()
@@ -6152,6 +6640,8 @@ let gatewayOptions = { port: 8443, hostname: '127.0.0.1', listenHost: '127.0.0.1
 let publicGatewaySettings = null
 let publicGatewayStatusCache = null
 let pendingGatewayMetadataSync = false
+const gatewayBlindPeerCatalog = new Map()
+const relayScopedBlindPeers = new Map()
 let gatewayRegistryRefreshTimer = null
 let blindPeerGatewayRegistryRefreshTimer = null
 let marmotService = null
@@ -7805,6 +8295,7 @@ global.fetchAndApplyRelayMirrorMetadata = fetchAndApplyRelayMirrorMetadata
 global.resolveRelayMirrorCoreRefs = resolveRelayMirrorCoreRefs
 global.getRelayMirrorCoreRefsCache = getRelayMirrorCoreRefsCache
 global.syncActiveRelayCoreRefs = syncActiveRelayCoreRefs
+global.rememberRelayScopedBlindPeer = rememberRelayScopedBlindPeer
 global.appendOpenJoinMirrorCores = appendOpenJoinMirrorCores
 global.recoverRelayDriveFile = recoverRelayDriveFile
 global.recoverConversationDriveFile = recoverConversationDriveFile
@@ -8225,11 +8716,10 @@ async function handleMessageObject(message) {
       try {
         const next = await updatePublicGatewaySettings(message.config || {})
         publicGatewaySettings = next
+        hydrateGatewayBlindPeerCatalog(next)
+        const effectiveNext = getEffectivePublicGatewaySettings(next)
         if (blindPeeringManager) {
-          blindPeeringManager.configure(next)
-          if (Array.isArray(next.blindPeerKeys) && next.blindPeerKeys.length) {
-            blindPeeringManager.markTrustedMirrors(next.blindPeerKeys)
-          }
+          blindPeeringManager.configure(effectiveNext)
           if (blindPeeringManager.enabled && !blindPeeringManager.started) {
             try {
               await blindPeeringManager.start({
@@ -8250,7 +8740,7 @@ async function handleMessageObject(message) {
         }
         if (gatewayService) {
           await gatewayService.updatePublicGatewayConfig(next)
-          publicGatewayStatusCache = gatewayService.getPublicGatewayState()
+          publicGatewayStatusCache = buildPublicGatewayStatusState(gatewayService.getPublicGatewayState())
           sendMessage({ type: 'public-gateway-status', state: publicGatewayStatusCache })
         }
         sendMessage({ type: 'public-gateway-config', config: next })
@@ -8262,7 +8752,7 @@ async function handleMessageObject(message) {
 
     case 'get-public-gateway-status': {
       if (gatewayService) {
-        const state = gatewayService.getPublicGatewayState()
+        const state = buildPublicGatewayStatusState(gatewayService.getPublicGatewayState())
         publicGatewayStatusCache = state
         sendMessage({ type: 'public-gateway-status', state })
       } else if (publicGatewayStatusCache) {
@@ -8277,7 +8767,8 @@ async function handleMessageObject(message) {
             defaultTokenTtl: publicGatewaySettings?.defaultTokenTtl || 3600,
             wsBase: null,
             lastUpdatedAt: null,
-            relays: {}
+            relays: {},
+            blindPeerCatalog: buildGatewayBlindPeerCatalogSnapshot()
           }
         })
       }
@@ -8317,7 +8808,7 @@ async function handleMessageObject(message) {
       try {
         if (!gatewayService) throw new Error('Gateway service not initialized')
         await gatewayService.syncPublicGatewayRelay(message.relayKey)
-        const state = gatewayService.getPublicGatewayState()
+        const state = buildPublicGatewayStatusState(gatewayService.getPublicGatewayState())
         publicGatewayStatusCache = state
         sendMessage({ type: 'public-gateway-status', state })
       } catch (err) {
@@ -8330,7 +8821,7 @@ async function handleMessageObject(message) {
       try {
         if (!gatewayService) throw new Error('Gateway service not initialized')
         await gatewayService.resyncPublicGateway()
-        const state = gatewayService.getPublicGatewayState()
+        const state = buildPublicGatewayStatusState(gatewayService.getPublicGatewayState())
         publicGatewayStatusCache = state
         sendMessage({ type: 'public-gateway-status', state })
       } catch (err) {
@@ -8933,6 +9424,22 @@ async function handleMessageObject(message) {
               actual: provisionalRouteAssignment?.actual || null
             })
           }
+          if (gatewayRouteInput.gatewayOrigin && gatewayRouteInput.directJoinOnly !== true) {
+            await primeRelayScopedBlindPeerForCreateRoute(gatewayRouteInput.gatewayOrigin, {
+              relayKey: provisionalRouteIdentity.relayKey,
+              gatewayId: gatewayRouteInput.gatewayId,
+              publicIdentifier: provisionalRouteIdentity.publicIdentifier,
+              reason: 'create-relay-input'
+            }).catch((error) => {
+              console.warn('[Worker] Failed to prime relay-scoped blind peer before create relay', {
+                gatewayOrigin: gatewayRouteInput.gatewayOrigin,
+                relayKey: provisionalRouteIdentity.relayKey,
+                publicIdentifier: provisionalRouteIdentity.publicIdentifier,
+                error: error?.message || error
+              })
+              return null
+            })
+          }
           const result = await relayServer.createRelay(requestData)
           const createSucceeded = result?.success !== false
           const resultRouteIdentity = extractRelayRouteIdentity(result)
@@ -8971,6 +9478,42 @@ async function handleMessageObject(message) {
               )
               routeError.code = 'create-route-assignment-missing'
               throw routeError
+            }
+            await primeRelayScopedBlindPeerForCreateRoute(gatewayRouteInput.gatewayOrigin, {
+              relayKey: resultRouteIdentity.relayKey,
+              gatewayId: gatewayRouteInput.gatewayId,
+              publicIdentifier: resultRouteIdentity.publicIdentifier,
+              reason: 'create-relay-route-assigned'
+            }).catch((error) => {
+              console.warn('[Worker] Failed to prime relay-scoped blind peer after route assignment', {
+                gatewayOrigin: gatewayRouteInput.gatewayOrigin,
+                relayKey: resultRouteIdentity.relayKey,
+                publicIdentifier: resultRouteIdentity.publicIdentifier,
+                error: error?.message || error
+              })
+              return null
+            })
+            if (resultRouteIdentity.relayKey) {
+              relayMirrorSyncState.delete(resultRouteIdentity.relayKey)
+              relayMirrorWriterSyncState.delete(resultRouteIdentity.relayKey)
+              const storedMirrorCoreRefs = await resolveRelayMirrorCoreRefs(
+                resultRouteIdentity.relayKey,
+                resultRouteIdentity.publicIdentifier
+              ).catch(() => [])
+              if (storedMirrorCoreRefs.length) {
+                await syncActiveRelayCoreRefs({
+                  relayKey: resultRouteIdentity.relayKey,
+                  publicIdentifier: resultRouteIdentity.publicIdentifier,
+                  coreRefs: storedMirrorCoreRefs,
+                  reason: 'create-relay-route-assigned'
+                }).catch((error) => {
+                  console.warn('[Worker] Failed to resync relay mirror after route assignment', {
+                    relayKey: resultRouteIdentity.relayKey,
+                    publicIdentifier: resultRouteIdentity.publicIdentifier,
+                    error: error?.message || error
+                  })
+                })
+              }
             }
           }
           relayMembers.set(result.relayKey, result.profile?.members || [])
@@ -10392,72 +10935,81 @@ async function handleMessageObject(message) {
               ensureJoinBudget('blind-peer-fallback', 1500)
               const fallbackBudgetMs = Math.max(1500, getRemainingJoinBudget() - JOIN_WRITABLE_BUDGET_MS)
               await withTimeout((async () => {
-                const manager = await ensureBlindPeeringManager()
-              if (manager) {
-                manager.markTrustedMirrors([blindPeer.publicKey])
-                const relayIdentifier = joinRelayKey || publicIdentifier
-                joinBlindPeeringManager = manager
-                joinRelayIdentifierForTracking = relayIdentifier
-                if (typeof manager.markJoinStart === 'function') {
-                  manager.markJoinStart({
-                    relayKey: relayIdentifier,
-                    publicIdentifier,
-                    reason: 'join-flow'
-                  })
-                }
-                const relayCorestore = getRelayCorestore(relayIdentifier, {
-                  storageBase: config?.storage || defaultStorageDir
-                })
-                console.log('[Worker] Blind-peer join flow: using relay corestore', {
-                  relayIdentifier,
-                  corestoreId: relayCorestore?.__ht_id || null,
-                  storagePath: relayCorestore?.__ht_storage_path || null
-                })
-                manager.ensureRelayMirror({
-                  relayKey: relayIdentifier,
+                await rememberRelayScopedBlindPeer(blindPeer, {
+                  relayKey: joinRelayKey || publicIdentifier || null,
                   publicIdentifier,
+                  gatewayOrigin: assignedGatewayOrigin || null,
+                  gatewayId: assignedGatewayId || null,
                   reason: 'join-flow',
-                  coreRefs,
-                  corestore: relayCorestore
+                  activateRuntime: true
                 })
-                console.log('[Worker] Blind-peer join flow: refreshing mirrors', {
-                  relayIdentifier,
-                  coreRefsCount: coreRefs.length,
-                  timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
-                  coreRefsPreview: coreRefs.map((key) => String(key).slice(0, 16))
-                })
-                await manager.refreshFromBlindPeers('join-flow')
-                if (typeof manager.primeRelayCoreRefs === 'function' && coreRefs.length) {
-                  const primeSummary = await manager.primeRelayCoreRefs({
+                const manager = await ensureBlindPeeringManager()
+                if (manager) {
+                  const relayIdentifier = joinRelayKey || publicIdentifier
+                  joinBlindPeeringManager = manager
+                  joinRelayIdentifierForTracking = relayIdentifier
+                  if (typeof manager.markJoinStart === 'function') {
+                    manager.markJoinStart({
+                      relayKey: relayIdentifier,
+                      publicIdentifier,
+                      reason: 'join-flow'
+                    })
+                  }
+                  const relayCorestore = getRelayCorestore(relayIdentifier, {
+                    storageBase: config?.storage || defaultStorageDir
+                  })
+                  console.log('[Worker] Blind-peer join flow: using relay corestore', {
+                    relayIdentifier,
+                    corestoreId: relayCorestore?.__ht_id || null,
+                    storagePath: relayCorestore?.__ht_storage_path || null
+                  })
+                  manager.ensureRelayMirror({
                     relayKey: relayIdentifier,
                     publicIdentifier,
-                    coreRefs,
-                    timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
                     reason: 'join-flow',
-                    corestore: relayCorestore
+                    coreRefs,
+                    corestore: relayCorestore,
+                    mirrorKeys: blindPeer?.publicKey ? [blindPeer.publicKey] : []
                   })
-                  console.log('[Worker] Blind-peer join flow: core prefetch completed', {
+                  console.log('[Worker] Blind-peer join flow: refreshing mirrors', {
                     relayIdentifier,
-                    status: primeSummary?.status ?? null,
-                    synced: primeSummary?.synced ?? null,
-                    failed: primeSummary?.failed ?? null,
-                    connected: primeSummary?.connected ?? null
+                    coreRefsCount: coreRefs.length,
+                    timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
+                    coreRefsPreview: coreRefs.map((key) => String(key).slice(0, 16))
                   })
-                }
-                const rehydrateSummary = await rehydrateMirrorsWithRetry(manager, {
-                  reason: 'join-flow',
-                  timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
-                  retries: BLIND_PEER_JOIN_REHYDRATION_RETRIES,
-                  backoffMs: BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS
-                })
-                console.log('[Worker] Blind-peer join flow: rehydration completed', {
-                  relayIdentifier,
-                  status: rehydrateSummary?.status ?? null,
-                  synced: rehydrateSummary?.synced ?? null,
-                  failed: rehydrateSummary?.failed ?? null
-                })
-                hostPeers = [String(blindPeer.publicKey).toLowerCase()]
-                console.log('[Worker] Using blind-peer mirror as host peer for join flow', {
+                  await manager.refreshFromBlindPeers('join-flow')
+                  if (typeof manager.primeRelayCoreRefs === 'function' && coreRefs.length) {
+                    const primeSummary = await manager.primeRelayCoreRefs({
+                      relayKey: relayIdentifier,
+                      publicIdentifier,
+                      coreRefs,
+                      timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
+                      reason: 'join-flow',
+                      corestore: relayCorestore,
+                      mirrorKeys: blindPeer?.publicKey ? [blindPeer.publicKey] : []
+                    })
+                    console.log('[Worker] Blind-peer join flow: core prefetch completed', {
+                      relayIdentifier,
+                      status: primeSummary?.status ?? null,
+                      synced: primeSummary?.synced ?? null,
+                      failed: primeSummary?.failed ?? null,
+                      connected: primeSummary?.connected ?? null
+                    })
+                  }
+                  const rehydrateSummary = await rehydrateMirrorsWithRetry(manager, {
+                    reason: 'join-flow',
+                    timeoutMs: BLIND_PEER_JOIN_REHYDRATION_TIMEOUT_MS,
+                    retries: BLIND_PEER_JOIN_REHYDRATION_RETRIES,
+                    backoffMs: BLIND_PEER_JOIN_REHYDRATION_BACKOFF_MS
+                  })
+                  console.log('[Worker] Blind-peer join flow: rehydration completed', {
+                    relayIdentifier,
+                    status: rehydrateSummary?.status ?? null,
+                    synced: rehydrateSummary?.synced ?? null,
+                    failed: rehydrateSummary?.failed ?? null
+                  })
+                  hostPeers = [String(blindPeer.publicKey).toLowerCase()]
+                  console.log('[Worker] Using blind-peer mirror as host peer for join flow', {
                   relayIdentifier,
                   coreRefsCount: coreRefs.length
                 })
@@ -11224,13 +11776,27 @@ async function handleMessageObject(message) {
                 publicIdentifier
               )
               if (eligibility.eligible) {
-                manager.ensureRelayMirror({
+                const mirrorKeys = await resolveRelayScopedMirrorKeys({
                   relayKey: resolvedRelayKey,
                   publicIdentifier,
-                  autobase: relayManager.relay,
-                  coreRefs: storedCoreRefs,
-                  corestore: relayManager.store || null
+                  reason: 'invite-writer',
+                  allowFallback: false
                 })
+                if (mirrorKeys.length > 0) {
+                  manager.ensureRelayMirror({
+                    relayKey: resolvedRelayKey,
+                    publicIdentifier,
+                    autobase: relayManager.relay,
+                    coreRefs: storedCoreRefs,
+                    corestore: relayManager.store || null,
+                    mirrorKeys
+                  })
+                } else {
+                  console.warn('[Worker] Invite writer mirror sync skipped (no relay-scoped mirror target)', {
+                    relayKey: resolvedRelayKey,
+                    publicIdentifier
+                  })
+                }
               } else {
                 await removeRelayMirrorTarget(manager, {
                   relayKey: resolvedRelayKey,
@@ -11421,12 +11987,25 @@ async function handleMessageObject(message) {
         }
 
         if (!resolvedRelayKey) {
+          const pendingDiscovery =
+            !!publicIdentifier
+            && !requestedRelayKey
+            && reason !== 'manual'
+          const unresolvedStatus = pendingDiscovery ? 'pending' : 'skipped'
+          const unresolvedReason = pendingDiscovery ? 'relay-pending-discovery' : 'relay-not-found'
+          if (pendingDiscovery) {
+            console.debug('[Worker] refresh-relay-subscriptions pending relay discovery', {
+              reason,
+              publicIdentifier,
+              requestedRelayKey: requestedRelayKey || null
+            })
+          }
           sendMessage({
             type: 'refresh-relay-subscriptions:result',
             requestId,
             data: {
-              status: 'skipped',
-              reason: 'relay-not-found',
+              status: unresolvedStatus,
+              reason: unresolvedReason,
               publicIdentifier,
               relayKey: null,
               requestedRelayKey: requestedRelayKey || null
@@ -11570,7 +12149,7 @@ async function handleMessageObject(message) {
         const finalRelayKey = refreshOutcome?.finalRelayKey || resolvedRelayKey
         const retryRelayKey = refreshOutcome?.retryRelayKey || null
         const retried = !!refreshOutcome?.retried
-        console.log('[Worker] refresh-relay-subscriptions result', {
+        const resultLogPayload = {
           reason,
           publicIdentifier,
           requestedRelayKey: requestedRelayKey || null,
@@ -11580,7 +12159,12 @@ async function handleMessageObject(message) {
           retryRelayKey,
           finalRelayKey,
           result
-        })
+        }
+        if (result?.status === 'skipped' && result?.reason === 'relay-pending-discovery') {
+          console.debug('[Worker] refresh-relay-subscriptions result', resultLogPayload)
+        } else {
+          console.log('[Worker] refresh-relay-subscriptions result', resultLogPayload)
+        }
         sendMessage({
           type: 'refresh-relay-subscriptions:result',
           requestId,
@@ -11919,6 +12503,14 @@ async function main() {
 
         // Set global user config for profile manager early (so downstream modules use correct scope)
         global.userConfig = { userKey, storage: userSpecificStorage }
+        setPublicGatewaySettingsNodeStorage({
+          filePath: join(userSpecificStorage, PUBLIC_GATEWAY_SETTINGS_FILENAME),
+          legacyFilePath: join(defaultStorageDir, PUBLIC_GATEWAY_SETTINGS_FILENAME)
+        })
+        publicGatewaySettings = null
+        publicGatewayStatusCache = null
+        gatewayBlindPeerCatalog.clear()
+        relayScopedBlindPeers.clear()
 
         // Load or create configuration *within user-specific storage*
         config = await loadOrCreateConfig(userSpecificStorage)
