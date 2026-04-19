@@ -3,7 +3,8 @@ import { EventEmitter } from 'node:events';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import Hyperswarm from 'hyperswarm';
-import BlindPeering from 'blind-peering';
+// Vendored to preserve late-added core replication semantics across clean installs and packed runtimes.
+import BlindPeering from './vendor/blind-peering/index.js';
 import HypercoreId from 'hypercore-id-encoding';
 
 const DEFAULT_BLIND_PEERING_GC_WAIT_MS = 10000;
