@@ -13,6 +13,18 @@ function createBlindPeering() {
   )
 }
 
+async function waitFor(assertion, { timeoutMs = 100, intervalMs = 1 } = {}) {
+  const deadline = Date.now() + timeoutMs
+
+  while (Date.now() < deadline) {
+    if (assertion()) return
+    await new Promise(resolve => setTimeout(resolve, intervalMs))
+  }
+
+  if (assertion()) return
+  throw new Error(`Timed out waiting for assertion after ${timeoutMs}ms`)
+}
+
 test('blind-peering replicates a late-added core onto an existing mirror stream', async t => {
   const blind = createBlindPeering()
   const stream = { destroyed: false, destroying: false, userData: null }
@@ -47,6 +59,7 @@ test('blind-peering replicates a late-added core onto an existing mirror stream'
   const result = await blind._mirrorCore(Buffer.alloc(32, 2), core, false, Buffer.alloc(32, 3), 1)
 
   t.alike(result, { ok: true })
+  await waitFor(() => replicated.length === 1)
   t.is(replicated.length, 1)
   t.is(replicated[0], stream)
 })
@@ -82,6 +95,7 @@ test('blind-peering mirrors late-added base writers onto an existing mirror stre
 
   await blind._mirrorBaseWriter(ref, base, core, true)
 
+  await waitFor(() => replicated.length === 1)
   t.is(replicated.length, 1)
   t.is(replicated[0], stream)
 })
