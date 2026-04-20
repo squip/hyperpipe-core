@@ -1,6 +1,6 @@
 {
   "name": "@squip/hyperpipe-core",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "First-party runtime engine for Hyperpipe clients",
   "type": "module",
   "main": "index.mjs",
@@ -60,7 +60,7 @@
   "dependencies": {
     "@noble/curves": "^2.0.1",
     "@noble/hashes": "^2.0.1",
-    "@squip/hyperpipe-bridge": "^0.1.0",
+    "@squip/hyperpipe-bridge": "^0.1.3",
     "applesauce-common": "^5.0.0",
     "applesauce-core": "^5.0.3",
     "autobase": "6.5.13",
